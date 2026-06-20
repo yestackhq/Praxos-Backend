@@ -75,6 +75,30 @@ class Cohort(Base):
     avg: Mapped[int] = mapped_column(Integer, default=0)
     completion: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(40), default="On track")
+    # Draft until the admin reviews the AI plan and submits — publishing pushes
+    # the lesson plan + document context into each member's memory.
+    published: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+
+
+class CohortDocument(Base):
+    """Ordered curriculum: the documents a cohort learns, in path order."""
+
+    __tablename__ = "cohort_documents"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cohort_id: Mapped[int] = mapped_column(ForeignKey("cohorts.id"))
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id"))
+    idx: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class CohortMember(Base):
+    """Which learners belong to a cohort."""
+
+    __tablename__ = "cohort_members"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cohort_id: Mapped[int] = mapped_column(ForeignKey("cohorts.id"))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
 
 
 class Document(Base):
@@ -122,6 +146,10 @@ class Module(Base):
     topics: Mapped[list] = mapped_column(JSON, default=list)
     minutes: Mapped[int] = mapped_column(Integer, default=5)
     source: Mapped[str] = mapped_column(String(200), default="")
+    # The chunk range this section is taught from, so the tutor is grounded in
+    # just this section's text (inclusive start, exclusive end).
+    chunk_start: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    chunk_end: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     document: Mapped[Document] = relationship(back_populates="modules")
 
@@ -160,3 +188,19 @@ class LearningSession(Base):
     score: Mapped[int] = mapped_column(Integer, default=0)
     duration: Mapped[str] = mapped_column(String(20), default="")
     topics: Mapped[str] = mapped_column(String(20), default="")
+
+
+class SectionProgress(Base):
+    """A learner's progress through one section (module) of a document. Lets a
+    paused section resume where it left off and drives the next-up section."""
+
+    __tablename__ = "section_progress"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id"))
+    module_idx: Mapped[int] = mapped_column(Integer, default=0)
+    # in_progress | paused | completed
+    status: Mapped[str] = mapped_column(String(20), default="in_progress")
+    score: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    updated_at: Mapped[str] = mapped_column(String(40), default="")

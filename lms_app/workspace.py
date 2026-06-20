@@ -103,6 +103,54 @@ def _pending(db: Session, ws_id: int) -> list[dict]:
     return [{"id": i.id, "email": i.email, "role": i.role} for i in invites]
 
 
+def _cohort_member_ids(db: Session, cohort_id: int) -> list[int]:
+    return list(
+        db.scalars(
+            select(models.CohortMember.user_id).where(models.CohortMember.cohort_id == cohort_id)
+        ).all()
+    )
+
+
+def _cohort_doc_ids(db: Session, cohort_id: int) -> list[int]:
+    return list(
+        db.scalars(
+            select(models.CohortDocument.document_id)
+            .where(models.CohortDocument.cohort_id == cohort_id)
+            .order_by(models.CohortDocument.idx)
+        ).all()
+    )
+
+
+def cohort_detail(db: Session, c: models.Cohort) -> dict:
+    """Full cohort shape for the admin UI (members + ordered documents + status)."""
+    member_ids = _cohort_member_ids(db, c.id)
+    doc_ids = _cohort_doc_ids(db, c.id)
+    docs = [
+        {"id": d.id, "name": d.name}
+        for d in (db.get(models.Document, did) for did in doc_ids)
+        if d is not None
+    ]
+    return {
+        "id": c.id,
+        "name": c.name,
+        "members": len(member_ids),
+        "memberIds": member_ids,
+        "documentIds": doc_ids,
+        "documents": docs,
+        "status": c.status,
+        "published": c.published,
+        "avg": c.avg,
+        "completion": c.completion,
+    }
+
+
+def _cohorts(db: Session, ws_id: int) -> list[dict]:
+    rows = db.scalars(
+        select(models.Cohort).where(models.Cohort.workspace_id == ws_id).order_by(models.Cohort.id)
+    ).all()
+    return [cohort_detail(db, c) for c in rows]
+
+
 def _documents(db: Session, ws_id: int) -> list[dict]:
     docs = db.scalars(
         select(models.Document).where(models.Document.workspace_id == ws_id).order_by(models.Document.id.desc())
@@ -149,7 +197,7 @@ def build_bundle(db: Session, user: models.User, display_name: str) -> dict:
             "cohortHealth": [],
             "needsAttention": [],
             "recentActivity": [],
-            "cohorts": [],
+            "cohorts": _cohorts(db, user.workspace_id),
             "people": _people(db, user.workspace_id),
             "pendingInvites": _pending(db, user.workspace_id),
             "teams": [],

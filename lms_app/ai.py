@@ -72,6 +72,66 @@ def score_understanding(doc_name: str, transcript: list[dict]) -> Optional[dict]
     return data
 
 
+def generate_lesson_plan(doc_name: str, chunks: list[str]) -> Optional[list[dict]]:
+    """Design a section-by-section teaching plan for a document from its text.
+
+    Returns an ordered list of section dicts — each a coherent unit a voice tutor
+    teaches in one sitting:
+      {title, description, topics: [str], minutes: int, chunk_start: int, chunk_end: int}
+    chunk_start/chunk_end index into ``chunks`` (inclusive start, exclusive end) so
+    the tutor is later grounded in just that section's text. None when OpenAI is
+    unconfigured or the model returns nothing usable."""
+    client = _client()
+    if client is None or not chunks:
+        return None
+    n = len(chunks)
+    numbered = "\n\n".join(f"[chunk {i}]\n{c[:900]}" for i, c in enumerate(chunks))[:24000]
+    system = (
+        "You are an expert curriculum designer for a voice-based microlearning tutor. "
+        f"You are given the document '{doc_name}', split into numbered chunks. Design a teaching "
+        "plan: break it into 3-8 ordered SECTIONS the tutor will teach one at a time, each a "
+        "coherent unit of a few minutes. For each section give: a short title; a 1-2 sentence "
+        "description of what the learner should come away understanding AND how to teach it (the "
+        "approach / what to emphasise and check); 2-4 key topics; estimated minutes (3-8); and the "
+        "contiguous chunk range it is taught from. Cover the whole document in order, no gaps or "
+        f"overlaps; chunk indices run 0..{n - 1}. Respond ONLY as JSON: "
+        '{"sections": [{"title": "...", "description": "...", "topics": ["..."], '
+        '"minutes": <int>, "chunk_start": <int>, "chunk_end": <int>}]} '
+        "where chunk_start is inclusive and chunk_end exclusive."
+    )
+    resp = client.chat.completions.create(
+        model=settings.OPENAI_CHAT_MODEL,
+        response_format={"type": "json_object"},
+        temperature=0.2,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": numbered},
+        ],
+    )
+    try:
+        data = json.loads(resp.choices[0].message.content or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    out: list[dict] = []
+    for i, s in enumerate(data.get("sections") or []):
+        try:
+            cs = max(0, min(n - 1, int(s.get("chunk_start", 0))))
+            ce = max(cs + 1, min(n, int(s.get("chunk_end", n))))
+        except (TypeError, ValueError):
+            cs, ce = 0, n
+        out.append(
+            {
+                "title": str(s.get("title") or f"Section {i + 1}")[:160],
+                "description": str(s.get("description") or "")[:2000],
+                "topics": [str(t)[:80] for t in (s.get("topics") or [])][:6],
+                "minutes": max(2, min(20, int(s.get("minutes", 5) or 5))),
+                "chunk_start": cs,
+                "chunk_end": ce,
+            }
+        )
+    return out or None
+
+
 def mint_realtime_session(instructions: str) -> Optional[dict]:
     """Create an ephemeral Realtime client secret the browser uses to open a
     WebRTC voice connection directly to OpenAI (the key never reaches the client).

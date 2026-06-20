@@ -104,6 +104,55 @@ def write_session(
         return False
 
 
+def write_lesson_plan(
+    *,
+    workspace_id: int,
+    user_id: int,
+    document_id: int,
+    doc_name: str,
+    modules: list[dict],
+    sync: bool = False,
+) -> bool:
+    """Seed a learner's memory for a document with the AI teaching plan, so the
+    tutor recalls WHAT to teach and HOW — section by section — from the very first
+    session. ``modules`` is a list of {idx, title, description, topics}. Returns
+    True on a 2xx, False otherwise — never raises."""
+    if not settings.helix_enabled or not modules:
+        return False
+    lines: list[str] = []
+    for m in modules:
+        topics = ", ".join(str(t) for t in (m.get("topics") or []))
+        line = f"Section {int(m.get('idx', 0)) + 1}: {m.get('title', '')}. {m.get('description', '')}"
+        if topics:
+            line += f" Key topics: {topics}."
+        lines.append(line)
+    plan_text = "\n".join(lines)
+
+    payload = {
+        **_scope(workspace_id, user_id, document_id),
+        "conversation_id": f"praxos-plan-doc{document_id}",
+        "sync": sync,
+        "turns": [
+            {"role": "user", "content": f"What will I learn from '{doc_name}' and how will you teach it?"},
+            {"role": "assistant", "content": f"[Lesson plan] Here is how I will teach '{doc_name}':\n{plan_text}"},
+        ],
+    }
+    try:
+        resp = httpx.post(
+            f"{settings.HELIX_URL}/v1/ingest",
+            headers=_headers(),
+            json=payload,
+            timeout=settings.HELIX_WRITE_TIMEOUT,
+        )
+        ok = resp.status_code < 300
+        if not ok:
+            logger.warning("helix plan ingest failed: %s %s", resp.status_code, resp.text[:200])
+        return ok
+    except Exception as exc:
+        logger.warning("helix plan ingest error: %s", exc)
+        return False
+
+
 def recall(
     *,
     workspace_id: int,

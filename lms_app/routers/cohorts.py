@@ -1,0 +1,338 @@
+from __future__ import annotations
+
+"""Cohort management + teaching-plan endpoints (admin only).
+
+A cohort is a group of learners assigned an ordered curriculum of documents.
+Creating a cohort drafts an AI teaching plan per document; the admin can edit it,
+then PUBLISH to push the plan + document context into every member's memory so the
+voice tutor knows what and how to teach, section by section."""
+
+from datetime import datetime, timezone
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
+from sqlalchemy import delete, func, select
+from sqlalchemy.orm import Session
+
+from .. import memory, models, plan as plan_service, workspace
+from ..auth import optional_claims
+from ..db import get_db
+
+router = APIRouter(prefix="/api", tags=["cohorts"])
+
+
+def _admin(claims: Optional[dict], db: Session) -> models.User:
+    sub = claims.get("sub") if claims else None
+    if not sub:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Sign in required")
+    user = db.scalar(select(models.User).where(models.User.clerk_id == sub))
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Unknown user")
+    if not workspace.is_admin(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only admins can manage cohorts")
+    return user
+
+
+class CohortIn(BaseModel):
+    name: str
+    documentIds: list[int] = []
+    memberUserIds: list[int] = []
+
+
+class CohortPatch(BaseModel):
+    name: Optional[str] = None
+    documentIds: Optional[list[int]] = None
+    memberUserIds: Optional[list[int]] = None
+
+
+def _get_cohort(db: Session, cid: int, ws_id: int) -> models.Cohort:
+    c = db.get(models.Cohort, cid)
+    if c is None or c.workspace_id != ws_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Cohort not found")
+    return c
+
+
+def _valid_doc_ids(db: Session, ws_id: int, ids: list[int]) -> list[int]:
+    if not ids:
+        return []
+    valid = set(
+        db.scalars(
+            select(models.Document.id).where(
+                models.Document.workspace_id == ws_id, models.Document.id.in_(ids)
+            )
+        ).all()
+    )
+    return [i for i in ids if i in valid]  # preserve caller order
+
+
+def _valid_member_ids(db: Session, ws_id: int, ids: list[int]) -> list[int]:
+    if not ids:
+        return []
+    valid = set(
+        db.scalars(
+            select(models.User.id).where(
+                models.User.workspace_id == ws_id, models.User.id.in_(ids)
+            )
+        ).all()
+    )
+    return [i for i in ids if i in valid]
+
+
+def _set_documents(db: Session, cohort: models.Cohort, doc_ids: list[int]) -> None:
+    db.execute(delete(models.CohortDocument).where(models.CohortDocument.cohort_id == cohort.id))
+    for idx, did in enumerate(doc_ids):
+        db.add(models.CohortDocument(cohort_id=cohort.id, document_id=did, idx=idx))
+
+
+def _set_members(db: Session, cohort: models.Cohort, member_ids: list[int], ws_id: int) -> None:
+    db.execute(delete(models.CohortMember).where(models.CohortMember.cohort_id == cohort.id))
+    for uid in member_ids:
+        db.add(models.CohortMember(cohort_id=cohort.id, user_id=uid))
+    cohort.members = len(member_ids)
+
+
+def _resync_member_labels(db: Session, ws_id: int) -> None:
+    """Recompute each user's denormalized ``cohort`` label (shown in the People
+    table) from their current memberships."""
+    db.flush()  # autoflush is off — make pending membership changes visible
+    rows = db.execute(
+        select(models.CohortMember.user_id, models.Cohort.name)
+        .join(models.Cohort, models.Cohort.id == models.CohortMember.cohort_id)
+        .where(models.Cohort.workspace_id == ws_id)
+        .order_by(models.Cohort.id)
+    ).all()
+    label: dict[int, str] = {}
+    for uid, name in rows:
+        label.setdefault(uid, name)
+    for u in db.scalars(select(models.User).where(models.User.workspace_id == ws_id)).all():
+        u.cohort = label.get(u.id, "—")
+
+
+def _draft_plans(db: Session, doc_ids: list[int]) -> None:
+    for did in doc_ids:
+        try:
+            plan_service.ensure_plan(db, did)
+        except Exception:  # plan generation is best-effort; never block cohort ops
+            pass
+
+
+@router.post("/cohorts", status_code=status.HTTP_201_CREATED)
+def create_cohort(body: CohortIn, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
+    user = _admin(claims, db)
+    name = (body.name or "").strip() or "Untitled cohort"
+    c = models.Cohort(workspace_id=user.workspace_id, name=name, status="Draft", published=False)
+    db.add(c)
+    db.flush()
+    doc_ids = _valid_doc_ids(db, user.workspace_id, body.documentIds)
+    member_ids = _valid_member_ids(db, user.workspace_id, body.memberUserIds)
+    _set_documents(db, c, doc_ids)
+    _set_members(db, c, member_ids, user.workspace_id)
+    _resync_member_labels(db, user.workspace_id)
+    db.commit()
+    _draft_plans(db, doc_ids)
+    db.refresh(c)
+    return workspace.cohort_detail(db, c)
+
+
+@router.patch("/cohorts/{cid}")
+def edit_cohort(cid: int, body: CohortPatch, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
+    user = _admin(claims, db)
+    c = _get_cohort(db, cid, user.workspace_id)
+    if body.name is not None and body.name.strip():
+        c.name = body.name.strip()
+    new_docs: list[int] = []
+    if body.documentIds is not None:
+        new_docs = _valid_doc_ids(db, user.workspace_id, body.documentIds)
+        _set_documents(db, c, new_docs)
+    if body.memberUserIds is not None:
+        member_ids = _valid_member_ids(db, user.workspace_id, body.memberUserIds)
+        _set_members(db, c, member_ids, user.workspace_id)
+    _resync_member_labels(db, user.workspace_id)
+    db.commit()
+    _draft_plans(db, new_docs)
+    db.refresh(c)
+    return workspace.cohort_detail(db, c)
+
+
+@router.delete("/cohorts/{cid}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_cohort(cid: int, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> None:
+    user = _admin(claims, db)
+    c = _get_cohort(db, cid, user.workspace_id)
+    db.execute(delete(models.CohortDocument).where(models.CohortDocument.cohort_id == c.id))
+    db.execute(delete(models.CohortMember).where(models.CohortMember.cohort_id == c.id))
+    db.delete(c)
+    db.commit()
+    _resync_member_labels(db, user.workspace_id)
+    db.commit()
+
+
+@router.post("/cohorts/{cid}/publish")
+def publish_cohort(cid: int, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
+    """Push each document's teaching plan + a learning-path seed into every
+    member's memory, so the tutor opens already knowing what and how to teach."""
+    user = _admin(claims, db)
+    c = _get_cohort(db, cid, user.workspace_id)
+    doc_ids = workspace._cohort_doc_ids(db, c.id)
+    member_ids = workspace._cohort_member_ids(db, c.id)
+    if not doc_ids or not member_ids:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Add at least one document and one learner before publishing.",
+        )
+    for did in doc_ids:
+        mods = plan_service.ensure_plan(db, did)
+        doc = db.get(models.Document, did)
+        if doc is None:
+            continue
+        mod_payload = [
+            {"idx": m.idx, "title": m.title, "description": m.description, "topics": m.topics}
+            for m in mods
+        ]
+        for uid in member_ids:
+            try:
+                memory.write_lesson_plan(
+                    workspace_id=user.workspace_id,
+                    user_id=uid,
+                    document_id=did,
+                    doc_name=doc.name,
+                    modules=mod_payload,
+                )
+            except Exception:  # memory push is best-effort
+                pass
+            _seed_path(db, uid, doc, len(mods))
+            _seed_progress(db, uid, did)
+        doc.assigned = len(member_ids)
+    c.published = True
+    c.status = "On track"
+    db.commit()
+    db.refresh(c)
+    return workspace.cohort_detail(db, c)
+
+
+def _seed_path(db: Session, user_id: int, doc: models.Document, sections: int) -> None:
+    """Add the document to a learner's learning path (idempotent by title)."""
+    existing = db.scalar(
+        select(models.LearningPathItem).where(
+            models.LearningPathItem.user_id == user_id,
+            models.LearningPathItem.title == doc.name,
+        )
+    )
+    if existing is not None:
+        existing.sections = sections
+        return
+    count = (
+        db.scalar(
+            select(func.count())
+            .select_from(models.LearningPathItem)
+            .where(models.LearningPathItem.user_id == user_id)
+        )
+        or 0
+    )
+    db.add(
+        models.LearningPathItem(
+            user_id=user_id,
+            idx=count,
+            title=doc.name,
+            sections=sections,
+            status="up_next" if count == 0 else "locked",
+            progress=0,
+        )
+    )
+
+
+def _seed_progress(db: Session, user_id: int, document_id: int) -> None:
+    """Seed section 0 as the resume point (idempotent)."""
+    existing = db.scalar(
+        select(models.SectionProgress).where(
+            models.SectionProgress.user_id == user_id,
+            models.SectionProgress.document_id == document_id,
+        )
+    )
+    if existing is None:
+        db.add(
+            models.SectionProgress(
+                user_id=user_id, document_id=document_id, module_idx=0, status="in_progress"
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# Teaching-plan endpoints (per document)
+# ---------------------------------------------------------------------------
+
+
+def _mod_out(m: models.Module) -> dict:
+    return {
+        "id": m.id,
+        "idx": m.idx,
+        "title": m.title,
+        "description": m.description,
+        "topics": m.topics,
+        "minutes": m.minutes,
+        "chunkStart": m.chunk_start,
+        "chunkEnd": m.chunk_end,
+    }
+
+
+def _own_doc(db: Session, did: int, ws_id: int) -> models.Document:
+    doc = db.get(models.Document, did)
+    if doc is None or doc.workspace_id != ws_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
+    return doc
+
+
+@router.get("/documents/{did}/plan")
+def get_plan(did: int, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
+    user = _admin(claims, db)
+    doc = _own_doc(db, did, user.workspace_id)
+    mods = plan_service.get_modules(db, did)
+    return {"document": {"id": doc.id, "name": doc.name}, "modules": [_mod_out(m) for m in mods]}
+
+
+@router.post("/documents/{did}/plan/generate")
+def regenerate_plan(did: int, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
+    user = _admin(claims, db)
+    doc = _own_doc(db, did, user.workspace_id)
+    mods = plan_service.generate_plan(db, did)
+    return {"document": {"id": doc.id, "name": doc.name}, "modules": [_mod_out(m) for m in mods]}
+
+
+class ModuleIn(BaseModel):
+    title: str
+    description: str = ""
+    topics: list[str] = []
+    minutes: int = 5
+
+
+class PlanPatch(BaseModel):
+    modules: list[ModuleIn]
+
+
+@router.patch("/documents/{did}/plan")
+def save_plan(did: int, body: PlanPatch, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
+    """Save the admin's edited plan. Chunk ranges are carried over by position so
+    section-by-section grounding survives a title/topic edit."""
+    user = _admin(claims, db)
+    doc = _own_doc(db, did, user.workspace_id)
+    old = plan_service.get_modules(db, did)
+    db.execute(delete(models.Module).where(models.Module.document_id == did))
+    for i, m in enumerate(body.modules):
+        cs = old[i].chunk_start if i < len(old) else 0
+        ce = old[i].chunk_end if i < len(old) else 0
+        db.add(
+            models.Module(
+                document_id=did,
+                idx=i,
+                title=m.title[:160],
+                description=m.description[:2000],
+                topics=[str(t)[:80] for t in m.topics][:6],
+                minutes=max(2, min(20, m.minutes or 5)),
+                chunk_start=cs,
+                chunk_end=ce,
+                source=f"Section {i + 1} · taught by voice",
+            )
+        )
+    db.commit()
+    mods = plan_service.get_modules(db, did)
+    return {"document": {"id": doc.id, "name": doc.name}, "modules": [_mod_out(m) for m in mods]}

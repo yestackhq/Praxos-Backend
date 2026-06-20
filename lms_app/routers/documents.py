@@ -17,17 +17,6 @@ def list_documents(db: Session = Depends(get_db)) -> list[schemas.DocumentOut]:
     return [schemas.DocumentOut.model_validate(r) for r in rows]
 
 
-@router.get("/{document_id}/plan", response_model=schemas.TeachingPlanOut)
-def teaching_plan(document_id: int, db: Session = Depends(get_db)) -> schemas.TeachingPlanOut:
-    doc = db.get(models.Document, document_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
-    return schemas.TeachingPlanOut(
-        doc=doc.name,
-        modules=[schemas.ModuleOut.model_validate(m) for m in doc.modules],
-    )
-
-
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_document(
     document_id: int, claims: dict = Depends(current_user), db: Session = Depends(get_db)
