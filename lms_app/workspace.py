@@ -169,9 +169,121 @@ def is_owner(db: Session, user: models.User) -> bool:
     return user.id == first_id
 
 
+# ---- Learner-side data (real assignments + progress, not mock) ----
+
+
+def _path_items(db: Session, user_id: int) -> list[models.LearningPathItem]:
+    return list(
+        db.scalars(
+            select(models.LearningPathItem)
+            .where(models.LearningPathItem.user_id == user_id)
+            .order_by(models.LearningPathItem.idx)
+        ).all()
+    )
+
+
+def _doc_by_name(db: Session, ws_id: int, name: str) -> Optional[models.Document]:
+    return db.scalar(
+        select(models.Document).where(
+            models.Document.workspace_id == ws_id, models.Document.name == name
+        )
+    )
+
+
+def _learning_path(db: Session, user: models.User) -> list[dict]:
+    return [
+        {"title": i.title, "sections": i.sections, "status": i.status, "progress": i.progress}
+        for i in _path_items(db, user.id)
+    ]
+
+
+def _my_documents(db: Session, user: models.User) -> list[dict]:
+    out: list[dict] = []
+    for i in _path_items(db, user.id):
+        doc = _doc_by_name(db, user.workspace_id, i.title)
+        status = (
+            "Mastered" if i.status == "mastered" else "Locked" if i.status == "locked" else "Assigned"
+        )
+        out.append(
+            {
+                "name": i.title,
+                "pages": doc.sections if doc else i.sections,
+                "status": status,
+                "added": "",
+                "docId": doc.id if doc else None,
+            }
+        )
+    return out
+
+
+def _past_sessions(db: Session, user: models.User) -> list[dict]:
+    rows = db.scalars(
+        select(models.LearningSession)
+        .where(models.LearningSession.user_id == user.id)
+        .order_by(models.LearningSession.id.desc())
+    ).all()
+    return [
+        {"doc": s.doc, "date": s.date, "score": s.score, "duration": s.duration, "topics": s.topics}
+        for s in rows[:10]
+    ]
+
+
+def _continue_learning(db: Session, user: models.User) -> Optional[dict]:
+    item = db.scalar(
+        select(models.LearningPathItem)
+        .where(
+            models.LearningPathItem.user_id == user.id,
+            models.LearningPathItem.status.in_(["in_progress", "up_next"]),
+        )
+        .order_by(models.LearningPathItem.idx)
+    )
+    if item is None:
+        return None
+    doc = _doc_by_name(db, user.workspace_id, item.title)
+    total = item.sections
+    cur = 1
+    if doc is not None:
+        total = (
+            db.scalar(
+                select(func.count()).select_from(models.Module).where(models.Module.document_id == doc.id)
+            )
+            or item.sections
+        )
+        prog = db.scalar(
+            select(models.SectionProgress).where(
+                models.SectionProgress.user_id == user.id,
+                models.SectionProgress.document_id == doc.id,
+            )
+        )
+        cur = (prog.module_idx + 1) if prog else 1
+    started = (item.progress or 0) > 0
+    return {
+        "doc": item.title,
+        "position": f"Section {min(cur, total)} of {total}" if total else "Ready to start",
+        "remaining": "Pick up where you left off." if started else "Start your first section.",
+        "understanding": item.progress if item.progress is not None else user.understanding,
+        "docId": doc.id if doc else None,
+    }
+
+
+def _learner_stats(db: Session, user: models.User) -> dict:
+    items = _path_items(db, user.id)
+    mastered = sum(1 for i in items if i.status == "mastered")
+    sessions = (
+        db.scalar(
+            select(func.count())
+            .select_from(models.LearningSession)
+            .where(models.LearningSession.user_id == user.id)
+        )
+        or 0
+    )
+    return {"pathProgress": f"{mastered} / {len(items)}", "sessions": int(sessions)}
+
+
 def build_bundle(db: Session, user: models.User, display_name: str) -> dict:
     ws = db.get(models.Workspace, user.workspace_id)
     needs_onboarding = (not ws.onboarded) and is_owner(db, user)
+    stats = _learner_stats(db, user)
     return {
         "mode": "user",
         "needsOnboarding": needs_onboarding,
@@ -182,15 +294,15 @@ def build_bundle(db: Session, user: models.User, display_name: str) -> dict:
             "name": display_name,
             "firstName": first_name(display_name),
             "understanding": user.understanding,
-            "pathProgress": "0 / 0",
+            "pathProgress": stats["pathProgress"],
             "practisedThisWeek": "0m",
-            "sessions": 0,
+            "sessions": stats["sessions"],
             "streak": 0,
         },
-        "continueLearning": None,
-        "learningPath": [],
-        "pastSessions": [],
-        "myDocuments": [],
+        "continueLearning": _continue_learning(db, user),
+        "learningPath": _learning_path(db, user),
+        "pastSessions": _past_sessions(db, user),
+        "myDocuments": _my_documents(db, user),
         "admin": {
             "kpis": ZERO_KPIS,
             "understandingTrend": [],
