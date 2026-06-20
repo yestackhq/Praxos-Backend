@@ -9,7 +9,7 @@ from .config import settings
 from sqlalchemy import text
 
 from .db import Base, SessionLocal, engine, ensure_schema
-from .routers import admin, bootstrap, cohorts, documents, learner, sessions
+from .routers import admin, bootstrap, cohorts, documents, learner, sessions, teams
 from .seed import seed
 
 
@@ -36,6 +36,7 @@ def _ensure_columns() -> None:
         conn.execute(text(f"ALTER TABLE {q('documents')} ADD COLUMN IF NOT EXISTS storage_path varchar(400)"))
         conn.execute(text(f"ALTER TABLE {q('invites')} ADD COLUMN IF NOT EXISTS clerk_invite_id varchar(120)"))
         conn.execute(text(f"ALTER TABLE {q('cohorts')} ADD COLUMN IF NOT EXISTS published boolean NOT NULL DEFAULT false"))
+        conn.execute(text(f"ALTER TABLE {q('teams')} ADD COLUMN IF NOT EXISTS published boolean NOT NULL DEFAULT false"))
         conn.execute(text(f"ALTER TABLE {q('modules')} ADD COLUMN IF NOT EXISTS chunk_start integer NOT NULL DEFAULT 0"))
         conn.execute(text(f"ALTER TABLE {q('modules')} ADD COLUMN IF NOT EXISTS chunk_end integer NOT NULL DEFAULT 0"))
 
@@ -98,3 +99,4 @@ app.include_router(admin.router)
 app.include_router(documents.router)
 app.include_router(sessions.router)
 app.include_router(cohorts.router)
+app.include_router(teams.router)

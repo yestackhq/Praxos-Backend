@@ -151,6 +151,51 @@ def _cohorts(db: Session, ws_id: int) -> list[dict]:
     return [cohort_detail(db, c) for c in rows]
 
 
+def _team_member_ids(db: Session, team_id: int) -> list[int]:
+    return list(
+        db.scalars(select(models.TeamMember.user_id).where(models.TeamMember.team_id == team_id)).all()
+    )
+
+
+def _team_doc_ids(db: Session, team_id: int) -> list[int]:
+    return list(
+        db.scalars(
+            select(models.TeamDocument.document_id)
+            .where(models.TeamDocument.team_id == team_id)
+            .order_by(models.TeamDocument.idx)
+        ).all()
+    )
+
+
+def team_detail(db: Session, t: models.Team) -> dict:
+    member_ids = _team_member_ids(db, t.id)
+    doc_ids = _team_doc_ids(db, t.id)
+    docs = [
+        {"id": d.id, "name": d.name}
+        for d in (db.get(models.Document, did) for did in doc_ids)
+        if d is not None
+    ]
+    return {
+        "id": t.id,
+        "name": t.name,
+        "lead": t.lead,
+        "members": len(member_ids),
+        "memberIds": member_ids,
+        "documentIds": doc_ids,
+        "documents": docs,
+        "published": t.published,
+        "avg": t.avg,
+        "paths": len(doc_ids),
+    }
+
+
+def _teams(db: Session, ws_id: int) -> list[dict]:
+    rows = db.scalars(
+        select(models.Team).where(models.Team.workspace_id == ws_id).order_by(models.Team.id)
+    ).all()
+    return [team_detail(db, t) for t in rows]
+
+
 def _documents(db: Session, ws_id: int) -> list[dict]:
     docs = db.scalars(
         select(models.Document).where(models.Document.workspace_id == ws_id).order_by(models.Document.id.desc())
@@ -312,7 +357,7 @@ def build_bundle(db: Session, user: models.User, display_name: str) -> dict:
             "cohorts": _cohorts(db, user.workspace_id),
             "people": _people(db, user.workspace_id),
             "pendingInvites": _pending(db, user.workspace_id),
-            "teams": [],
+            "teams": _teams(db, user.workspace_id),
             "documents": _documents(db, user.workspace_id),
         },
     }

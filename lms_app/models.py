@@ -59,10 +59,32 @@ class Team(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id"))
     name: Mapped[str] = mapped_column(String(120))
-    lead: Mapped[str] = mapped_column(String(120))
+    lead: Mapped[str] = mapped_column(String(120), default="")
     members: Mapped[int] = mapped_column(Integer, default=0)
     paths: Mapped[int] = mapped_column(Integer, default=0)
     avg: Mapped[int] = mapped_column(Integer, default=0)
+    published: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+
+
+class TeamDocument(Base):
+    """Ordered curriculum assigned to a team."""
+
+    __tablename__ = "team_documents"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.id"))
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id"))
+    idx: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class TeamMember(Base):
+    """Which learners belong to a team."""
+
+    __tablename__ = "team_members"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.id"))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
 
 
 class Cohort(Base):
