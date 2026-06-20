@@ -94,12 +94,30 @@ def mint_realtime_session(instructions: str) -> Optional[dict]:
                 "model": settings.OPENAI_REALTIME_MODEL,
                 "instructions": instructions,
                 "audio": {
-                    "input": {"transcription": {"model": "whisper-1"}},
+                    "input": {
+                        "transcription": {"model": "whisper-1"},
+                        # Filter steady background noise so the mic doesn't pick up
+                        # room hum / keyboard as "speech".
+                        "noise_reduction": {"type": "near_field"},
+                        # Server-side voice-activity detection. A higher threshold
+                        # + longer trailing silence stops the tutor from thinking
+                        # the learner is talking when it's just background noise.
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.72,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 900,
+                            "create_response": True,
+                            "interrupt_response": True,
+                        },
+                    },
                     "output": {"voice": settings.OPENAI_REALTIME_VOICE},
                 },
             }
         },
         timeout=20,
     )
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        # Surface OpenAI's reason (e.g. an unknown session field) instead of a bare 500.
+        raise RuntimeError(f"Realtime mint failed: {resp.status_code} {resp.text[:300]}")
     return resp.json()

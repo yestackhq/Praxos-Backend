@@ -75,7 +75,9 @@ def _build_instructions(db: Session, doc: models.Document, recap: str = "") -> s
         "Teach it conversationally in short turns: explain a key point, then ask the learner "
         "a question to check understanding. Listen to their answer, give brief feedback, and "
         "move on. Stay strictly within the material below — if asked something outside it, say "
-        "so. Keep replies under three sentences so it feels like a real conversation."
+        "so. Keep replies under three sentences so it feels like a real conversation. "
+        "IMPORTANT: speak FIRST the moment the session begins — greet the learner and start "
+        "teaching the first point right away; never sit silently waiting for them to talk."
         f"{memory_block}"
         f"\n--- DOCUMENT CONTENT ---\n{context}"
     )
