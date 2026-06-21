@@ -368,6 +368,89 @@ def _understanding_trend(db: Session, ws_id: int) -> list[dict]:
     return out
 
 
+def _avg_understanding(db: Session, user_ids: list[int]) -> int:
+    """Average understanding over the MEASURED members of a group (those with a
+    score > 0). 0 when nobody in the group has been measured yet."""
+    if not user_ids:
+        return 0
+    scores = [
+        u.understanding
+        for u in db.scalars(select(models.User).where(models.User.id.in_(user_ids))).all()
+        if u.understanding and u.understanding > 0
+    ]
+    return round(sum(scores) / len(scores)) if scores else 0
+
+
+def _understanding_kpis(db: Session, ws_id: int) -> list[dict]:
+    """Real, workspace-scoped headline numbers for the Understanding page."""
+    users = list(db.scalars(select(models.User).where(models.User.workspace_id == ws_id)).all())
+    measured = [u.understanding for u in users if u.understanding and u.understanding > 0]
+    avg = round(sum(measured) / len(measured)) if measured else 0
+    docs = (
+        db.scalar(select(func.count()).select_from(models.Document).where(models.Document.workspace_id == ws_id))
+        or 0
+    )
+    topics = (
+        db.scalar(
+            select(func.count())
+            .select_from(models.Module)
+            .join(models.Document, models.Document.id == models.Module.document_id)
+            .where(models.Document.workspace_id == ws_id)
+        )
+        or 0
+    )
+    user_ids = [u.id for u in users]
+    total = mastered = 0
+    if user_ids:
+        items = list(
+            db.scalars(
+                select(models.LearningPathItem).where(models.LearningPathItem.user_id.in_(user_ids))
+            ).all()
+        )
+        total = len(items)
+        mastered = sum(1 for i in items if i.status == "mastered")
+    mastery = round(100 * mastered / total) if total else 0
+    return [
+        {"label": "Average understanding", "value": str(avg), "hint": "demonstrated, not guessed"},
+        {"label": "Learners measured", "value": str(len(measured)), "hint": "in this workspace"},
+        {"label": "Topics tracked", "value": str(int(topics)), "hint": f"from {int(docs)} document{'' if docs == 1 else 's'}"},
+        {"label": "Mastery rate", "value": f"{mastery}%", "hint": "sections mastered"},
+    ]
+
+
+def _cohort_health(db: Session, ws_id: int) -> list[dict]:
+    return [
+        {"name": c.name, "value": _avg_understanding(db, _cohort_member_ids(db, c.id)), "pct": c.completion}
+        for c in db.scalars(
+            select(models.Cohort).where(models.Cohort.workspace_id == ws_id).order_by(models.Cohort.id)
+        ).all()
+    ]
+
+
+def _team_health(db: Session, ws_id: int) -> list[dict]:
+    return [
+        {"name": t.name, "value": _avg_understanding(db, _team_member_ids(db, t.id))}
+        for t in db.scalars(
+            select(models.Team).where(models.Team.workspace_id == ws_id).order_by(models.Team.id)
+        ).all()
+    ]
+
+
+def _falling_behind(db: Session, ws_id: int) -> list[dict]:
+    users = db.scalars(
+        select(models.User).where(models.User.workspace_id == ws_id).order_by(models.User.understanding)
+    ).all()
+    return [
+        {
+            "name": u.name,
+            "cohort": u.cohort if u.cohort and u.cohort != "—" else "No cohort",
+            "score": u.understanding,
+        }
+        for u in users
+        if u.understanding and 0 < u.understanding < 55
+    ][:8]
+
+
 def build_bundle(db: Session, user: models.User, display_name: str) -> dict:
     ws = db.get(models.Workspace, user.workspace_id)
     needs_onboarding = (not ws.onboarded) and is_owner(db, user)
@@ -393,9 +476,11 @@ def build_bundle(db: Session, user: models.User, display_name: str) -> dict:
         "myDocuments": _my_documents(db, user),
         "admin": {
             "kpis": ZERO_KPIS,
+            "understandingKpis": _understanding_kpis(db, user.workspace_id),
             "understandingTrend": _understanding_trend(db, user.workspace_id),
-            "cohortHealth": [],
-            "needsAttention": [],
+            "cohortHealth": _cohort_health(db, user.workspace_id),
+            "teamHealth": _team_health(db, user.workspace_id),
+            "needsAttention": _falling_behind(db, user.workspace_id),
             "recentActivity": [],
             "cohorts": _cohorts(db, user.workspace_id),
             "people": _people(db, user.workspace_id),
