@@ -219,6 +219,9 @@ def _seed_path(db: Session, user_id: int, doc: models.Document, sections: int) -
         )
     )
     if existing is not None:
+        # Already on this learner's path — keep their status/progress; only refresh
+        # the section count. This is what makes re-publishing (after adding a new
+        # doc) NON-destructive to what they've already learnt.
         existing.sections = sections
         return
     count = (
@@ -229,13 +232,24 @@ def _seed_path(db: Session, user_id: int, doc: models.Document, sections: int) -
         )
         or 0
     )
+    # A newly-added document is immediately learnable when the learner has nothing
+    # active (e.g. finished their current docs); otherwise it's queued (locked) and
+    # unlocks when the current document is mastered — so it's an EXPANSION, never a
+    # reset of in-flight progress.
+    has_active = db.scalar(
+        select(models.LearningPathItem.id).where(
+            models.LearningPathItem.user_id == user_id,
+            models.LearningPathItem.status.in_(["in_progress", "up_next"]),
+        )
+    )
+    status = "up_next" if (count == 0 or has_active is None) else "locked"
     db.add(
         models.LearningPathItem(
             user_id=user_id,
             idx=count,
             title=doc.name,
             sections=sections,
-            status="up_next" if count == 0 else "locked",
+            status=status,
             progress=0,
         )
     )

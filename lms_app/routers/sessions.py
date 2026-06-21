@@ -276,7 +276,23 @@ def score_session(body: ScoreIn, claims: Optional[dict] = Depends(optional_claim
         )
         if item is not None:
             item.progress = pct
-            item.status = "mastered" if pct >= 100 else "in_progress"
+            if pct >= 100:
+                item.status = "mastered"
+                # Unlock the next document in the path so a multi-document / EXPANDED
+                # cohort flows forward — a doc added later becomes learnable in turn,
+                # without disturbing anything the learner has already done.
+                nxt = db.scalar(
+                    select(models.LearningPathItem)
+                    .where(
+                        models.LearningPathItem.user_id == user.id,
+                        models.LearningPathItem.status == "locked",
+                    )
+                    .order_by(models.LearningPathItem.idx)
+                )
+                if nxt is not None:
+                    nxt.status = "up_next"
+            else:
+                item.status = "in_progress"
     db.commit()
 
     return {
