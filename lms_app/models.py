@@ -37,6 +37,7 @@ class Workspace(Base):
     name: Mapped[str] = mapped_column(String(120))
     plan: Mapped[str] = mapped_column(String(60), default="Admin workspace")
     onboarded: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    slug: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
 
 
 class User(Base):

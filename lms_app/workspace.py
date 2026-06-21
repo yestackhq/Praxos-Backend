@@ -1,11 +1,27 @@
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from . import models
+
+
+def clean_name(name: str) -> str:
+    """Readable document title from a raw upload filename: drop the extension and
+    the underscores/dashes uploaders leave behind."""
+    base = re.sub(r"\.pdf$", "", name or "", flags=re.IGNORECASE)
+    base = re.sub(r"[_-]+", " ", base)
+    base = re.sub(r"\s+", " ", base).strip()
+    return base or name
+
+
+def slugify(value: str) -> str:
+    """URL-safe workspace slug from a name/link, e.g. 'Acme Inc.' → 'acme-inc'."""
+    s = re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
+    return s[:60] or "workspace"
 
 ZERO_KPIS = [
     {"label": "Avg understanding", "value": "0", "hint": "no sessions yet"},
@@ -236,10 +252,19 @@ def _doc_by_name(db: Session, ws_id: int, name: str) -> Optional[models.Document
 
 
 def _learning_path(db: Session, user: models.User) -> list[dict]:
-    return [
-        {"title": i.title, "sections": i.sections, "status": i.status, "progress": i.progress}
-        for i in _path_items(db, user.id)
-    ]
+    out: list[dict] = []
+    for i in _path_items(db, user.id):
+        doc = _doc_by_name(db, user.workspace_id, i.title)
+        out.append(
+            {
+                "title": clean_name(i.title),
+                "sections": i.sections,
+                "status": i.status,
+                "progress": i.progress,
+                "docId": doc.id if doc else None,
+            }
+        )
+    return out
 
 
 def _my_documents(db: Session, user: models.User) -> list[dict]:
@@ -251,7 +276,7 @@ def _my_documents(db: Session, user: models.User) -> list[dict]:
         )
         out.append(
             {
-                "name": i.title,
+                "name": clean_name(i.title),
                 "pages": doc.sections if doc else i.sections,
                 "status": status,
                 "added": "",
@@ -268,7 +293,7 @@ def _past_sessions(db: Session, user: models.User) -> list[dict]:
         .order_by(models.LearningSession.id.desc())
     ).all()
     return [
-        {"doc": s.doc, "date": s.date, "score": s.score, "duration": s.duration, "topics": s.topics}
+        {"doc": clean_name(s.doc), "date": s.date, "score": s.score, "duration": s.duration, "topics": s.topics}
         for s in rows[:10]
     ]
 
@@ -303,7 +328,7 @@ def _continue_learning(db: Session, user: models.User) -> Optional[dict]:
         cur = (prog.module_idx + 1) if prog else 1
     started = (item.progress or 0) > 0
     return {
-        "doc": item.title,
+        "doc": clean_name(item.title),
         "position": f"Section {min(cur, total)} of {total}" if total else "Ready to start",
         "remaining": "Pick up where you left off." if started else "Start your first section.",
         "understanding": item.progress if item.progress is not None else user.understanding,
@@ -325,6 +350,24 @@ def _learner_stats(db: Session, user: models.User) -> dict:
     return {"pathProgress": f"{mastered} / {len(items)}", "sessions": int(sessions)}
 
 
+def _understanding_trend(db: Session, ws_id: int) -> list[dict]:
+    """Workspace understanding over time: one point per session (last 12),
+    oldest → newest, for the admin trend chart. Empty until sessions exist."""
+    rows = db.execute(
+        select(models.LearningSession.date, models.LearningSession.score)
+        .join(models.User, models.User.id == models.LearningSession.user_id)
+        .where(models.User.workspace_id == ws_id)
+        .order_by(models.LearningSession.id)
+    ).all()
+    rows = rows[-12:]
+    out: list[dict] = []
+    for idx, (d, s) in enumerate(rows):
+        # Label alternate points to keep the x-axis readable (ISO date → MM-DD).
+        label = (d or "")[5:] if idx % 2 == 0 else ""
+        out.append({"m": label, "v": int(s or 0)})
+    return out
+
+
 def build_bundle(db: Session, user: models.User, display_name: str) -> dict:
     ws = db.get(models.Workspace, user.workspace_id)
     needs_onboarding = (not ws.onboarded) and is_owner(db, user)
@@ -332,7 +375,7 @@ def build_bundle(db: Session, user: models.User, display_name: str) -> dict:
     return {
         "mode": "user",
         "needsOnboarding": needs_onboarding,
-        "workspace": {"name": ws.name, "plan": ws.plan},
+        "workspace": {"name": ws.name, "plan": ws.plan, "slug": ws.slug or slugify(ws.name)},
         "account": {"name": display_name, "email": user.email, "role": "Workspace owner" if is_admin(user) else user.role},
         "role": user.role,
         "learner": {
@@ -350,7 +393,7 @@ def build_bundle(db: Session, user: models.User, display_name: str) -> dict:
         "myDocuments": _my_documents(db, user),
         "admin": {
             "kpis": ZERO_KPIS,
-            "understandingTrend": [],
+            "understandingTrend": _understanding_trend(db, user.workspace_id),
             "cohortHealth": [],
             "needsAttention": [],
             "recentActivity": [],

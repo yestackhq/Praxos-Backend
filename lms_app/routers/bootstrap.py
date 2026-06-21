@@ -33,6 +33,7 @@ class RoleIn(BaseModel):
 
 class OnboardingIn(BaseModel):
     workspaceName: Optional[str] = None
+    slug: Optional[str] = None
 
 
 class DocumentIn(BaseModel):
@@ -63,6 +64,8 @@ def complete_onboarding(body: OnboardingIn, claims: Optional[dict] = Depends(opt
     name = (body.workspaceName or "").strip()
     if name:
         ws.name = name
+    # Workspace link: an explicit slug, else derived from the name.
+    ws.slug = workspace.slugify(body.slug or name or ws.name)
     ws.onboarded = True
     db.commit()
     return workspace.build_bundle(db, user, user.name)

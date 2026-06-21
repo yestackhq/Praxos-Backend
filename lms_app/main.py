@@ -33,6 +33,7 @@ def _ensure_columns() -> None:
     q = lambda t: f'"{schema}".{t}' if schema else t  # noqa: E731
     with engine.begin() as conn:
         conn.execute(text(f"ALTER TABLE {q('workspaces')} ADD COLUMN IF NOT EXISTS onboarded boolean NOT NULL DEFAULT false"))
+        conn.execute(text(f"ALTER TABLE {q('workspaces')} ADD COLUMN IF NOT EXISTS slug varchar(80)"))
         conn.execute(text(f"ALTER TABLE {q('documents')} ADD COLUMN IF NOT EXISTS storage_path varchar(400)"))
         conn.execute(text(f"ALTER TABLE {q('invites')} ADD COLUMN IF NOT EXISTS clerk_invite_id varchar(120)"))
         conn.execute(text(f"ALTER TABLE {q('cohorts')} ADD COLUMN IF NOT EXISTS published boolean NOT NULL DEFAULT false"))
