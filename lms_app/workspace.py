@@ -92,15 +92,31 @@ def is_admin(user: models.User) -> bool:
     return user.role in ("Admin", "Owner")
 
 
+def _user_team_map(db: Session, ws_id: int) -> dict[int, str]:
+    """Map each user to their (first) team name in the workspace."""
+    rows = db.execute(
+        select(models.TeamMember.user_id, models.Team.name)
+        .join(models.Team, models.Team.id == models.TeamMember.team_id)
+        .where(models.Team.workspace_id == ws_id)
+        .order_by(models.Team.id)
+    ).all()
+    out: dict[int, str] = {}
+    for uid, name in rows:
+        out.setdefault(uid, name)
+    return out
+
+
 def _people(db: Session, ws_id: int) -> list[dict]:
     users = db.scalars(
         select(models.User).where(models.User.workspace_id == ws_id).order_by(models.User.id)
     ).all()
+    team_of = _user_team_map(db, ws_id)
     return [
         {
             "name": u.name,
             "email": u.email,
             "cohort": u.cohort,
+            "team": team_of.get(u.id, ""),
             "documents": u.documents,
             "understanding": u.understanding,
             "role": u.role,
@@ -368,6 +384,18 @@ def _understanding_trend(db: Session, ws_id: int) -> list[dict]:
     return out
 
 
+def _understanding_series(db: Session, ws_id: int) -> list[dict]:
+    """Raw workspace session points (ISO date + score), oldest → newest, so the
+    Overview chart can re-bucket by week / month / quarter."""
+    rows = db.execute(
+        select(models.LearningSession.date, models.LearningSession.score)
+        .join(models.User, models.User.id == models.LearningSession.user_id)
+        .where(models.User.workspace_id == ws_id)
+        .order_by(models.LearningSession.id)
+    ).all()
+    return [{"date": d or "", "score": int(s or 0)} for d, s in rows]
+
+
 def _avg_understanding(db: Session, user_ids: list[int]) -> int:
     """Average understanding over the MEASURED members of a group (those with a
     score > 0). 0 when nobody in the group has been measured yet."""
@@ -478,6 +506,7 @@ def build_bundle(db: Session, user: models.User, display_name: str) -> dict:
             "kpis": ZERO_KPIS,
             "understandingKpis": _understanding_kpis(db, user.workspace_id),
             "understandingTrend": _understanding_trend(db, user.workspace_id),
+            "understandingSeries": _understanding_series(db, user.workspace_id),
             "cohortHealth": _cohort_health(db, user.workspace_id),
             "teamHealth": _team_health(db, user.workspace_id),
             "needsAttention": _falling_behind(db, user.workspace_id),

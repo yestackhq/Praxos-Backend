@@ -336,3 +336,41 @@ def save_plan(did: int, body: PlanPatch, claims=Depends(optional_claims), db: Se
     db.commit()
     mods = plan_service.get_modules(db, did)
     return {"document": {"id": doc.id, "name": doc.name}, "modules": [_mod_out(m) for m in mods]}
+
+
+@router.get("/people/{uid}")
+def person_detail(uid: int, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
+    """Full detail for one learner — drives the Understanding row sidebar."""
+    admin = _admin(claims, db)
+    u = db.get(models.User, uid)
+    if u is None or u.workspace_id != admin.workspace_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Person not found")
+    team = workspace._user_team_map(db, admin.workspace_id).get(u.id, "")
+    sessions = db.scalars(
+        select(models.LearningSession)
+        .where(models.LearningSession.user_id == u.id)
+        .order_by(models.LearningSession.id.desc())
+    ).all()
+    path = db.scalars(
+        select(models.LearningPathItem)
+        .where(models.LearningPathItem.user_id == u.id)
+        .order_by(models.LearningPathItem.idx)
+    ).all()
+    return {
+        "id": u.id,
+        "name": u.name,
+        "email": u.email,
+        "role": u.role,
+        "cohort": u.cohort if u.cohort and u.cohort != "—" else "",
+        "team": team,
+        "understanding": u.understanding,
+        "documents": u.documents,
+        "sessions": [
+            {"doc": workspace.clean_name(s.doc), "date": s.date, "score": s.score, "duration": s.duration}
+            for s in sessions[:12]
+        ],
+        "path": [
+            {"title": workspace.clean_name(i.title), "status": i.status, "progress": i.progress}
+            for i in path
+        ],
+    }
