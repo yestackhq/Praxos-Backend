@@ -36,56 +36,172 @@ def first_name(name: Optional[str]) -> str:
     return (name or "there").strip().split(" ")[0] or "there"
 
 
-def resolve_user(db: Session, sub: str, name: Optional[str], email: Optional[str]) -> models.User:
-    """Find the user by Clerk id, or create them on first login.
+def _ensure_membership(
+    db: Session, sub: str, ws_id: int, email: Optional[str], name: Optional[str], role: str
+) -> bool:
+    """Ensure a (clerk_id, workspace_id) membership row exists. Claims a pre-seeded
+    member row matched by email (clerk_id still NULL) rather than duplicating it.
+    Returns True if a row was created or claimed."""
+    member = db.scalar(
+        select(models.User).where(
+            models.User.clerk_id == sub, models.User.workspace_id == ws_id
+        )
+    )
+    if member is not None:
+        return False
+    orphan = db.scalar(
+        select(models.User).where(
+            models.User.workspace_id == ws_id,
+            func.lower(models.User.email) == (email or "").lower(),
+            models.User.clerk_id.is_(None),
+        )
+    )
+    if orphan is not None:
+        orphan.clerk_id = sub
+        if role and orphan.role != role:
+            orphan.role = role
+        return True
+    db.add(
+        models.User(
+            clerk_id=sub,
+            workspace_id=ws_id,
+            name=name or "New user",
+            email=email or f"{sub}@clerk.local",
+            role=role,
+            cohort="—",
+            documents=0,
+            understanding=0,
+        )
+    )
+    return True
 
-    On first login we check for a pending invite matching their email: if found,
-    they JOIN that workspace with the invited role; otherwise they get a fresh
-    personal workspace as its Admin.
-    """
-    user = db.scalar(select(models.User).where(models.User.clerk_id == sub))
-    if user is not None:
-        if name and user.name != name:
-            user.name = name
-        if email and user.email != email:
-            user.email = email
+
+def apply_pending_invites(db: Session, sub: str, email: Optional[str], name: Optional[str] = None) -> bool:
+    """Join this person to every workspace that has a pending invite for their email,
+    marking those invites accepted. Runs on every bootstrap (not one-shot), so an
+    ALREADY-registered user gains the new membership instead of the invite being
+    ignored. Idempotent. Returns True if anything changed."""
+    if not email:
+        return False
+    invites = db.scalars(
+        select(models.Invite).where(
+            func.lower(models.Invite.email) == email.lower(),
+            models.Invite.status == "pending",
+        )
+    ).all()
+    changed = False
+    for inv in invites:
+        _ensure_membership(db, sub, inv.workspace_id, email, name, inv.role)
+        inv.status = "accepted"
+        changed = True
+    if changed:
         db.commit()
-        return user
+    return changed
 
-    invite = None
-    if email:
-        invite = db.scalar(
-            select(models.Invite).where(
-                func.lower(models.Invite.email) == email.lower(),
-                models.Invite.status == "pending",
+
+def reconcile_memberships(db: Session) -> int:
+    """One-time/idempotent backfill across ALL existing data: for every pending
+    invite whose email belongs to an already-signed-up person (a user row with a
+    clerk_id), create the missing membership and mark the invite accepted. This
+    "moves" existing data into the multi-membership model and stops people who have
+    accepted from showing as a pending invite. Returns the number of invites resolved."""
+    invites = db.scalars(select(models.Invite).where(models.Invite.status == "pending")).all()
+    resolved = 0
+    for inv in invites:
+        rows = db.scalars(
+            select(models.User).where(
+                func.lower(models.User.email) == inv.email.lower(),
+                models.User.clerk_id.is_not(None),
             )
+        ).all()
+        if not rows:
+            continue
+        seen: set[str] = set()
+        for r in rows:
+            if r.clerk_id in seen:
+                continue
+            seen.add(r.clerk_id)
+            _ensure_membership(db, r.clerk_id, inv.workspace_id, inv.email, r.name, inv.role)
+        inv.status = "accepted"
+        resolved += 1
+    if resolved:
+        db.commit()
+    return resolved
+
+
+def resolve_active_membership(
+    db: Session,
+    sub: str,
+    active_ws_id: Optional[int] = None,
+    name: Optional[str] = None,
+    email: Optional[str] = None,
+) -> models.User:
+    """Resolve the signed-in person's ACTIVE workspace membership.
+
+    1. Apply any pending invites matching their email (creating memberships) so an
+       invited workspace shows up without re-signup.
+    2. Ensure at least one membership — first-ever login with no invite gets a fresh
+       personal workspace as its Admin.
+    3. Return the membership for ``active_ws_id`` when the person belongs to it, else
+       their default (earliest) membership. A stale/forged id can never select a
+       workspace they aren't a member of.
+    """
+    def _memberships() -> list[models.User]:
+        return list(
+            db.scalars(
+                select(models.User)
+                .where(models.User.clerk_id == sub)
+                .order_by(models.User.id)
+            ).all()
         )
 
-    if invite is not None:
-        ws_id = invite.workspace_id
-        role = invite.role
-        invite.status = "accepted"
-    else:
-        ws = models.Workspace(name=f"{first_name(name)}'s workspace", plan="Personal workspace")
+    memberships = _memberships()
+    eff_email = email or (memberships[0].email if memberships else None)
+    eff_name = name or (memberships[0].name if memberships else None)
+
+    if apply_pending_invites(db, sub, eff_email, eff_name):
+        memberships = _memberships()
+
+    if not memberships:
+        ws = models.Workspace(name=f"{first_name(eff_name)}'s workspace", plan="Personal workspace")
         db.add(ws)
         db.flush()
-        ws_id = ws.id
-        role = "Admin"
+        user = models.User(
+            clerk_id=sub,
+            workspace_id=ws.id,
+            name=eff_name or "New user",
+            email=eff_email or f"{sub}@clerk.local",
+            role="Admin",
+            cohort="—",
+            documents=0,
+            understanding=0,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        memberships = [user]
 
-    user = models.User(
-        clerk_id=sub,
-        workspace_id=ws_id,
-        name=name or "New user",
-        email=email or f"{sub}@clerk.local",
-        role=role,
-        cohort="-",
-        documents=0,
-        understanding=0,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return user
+    active = None
+    if active_ws_id is not None:
+        active = next((m for m in memberships if m.workspace_id == active_ws_id), None)
+    if active is None:
+        active = memberships[0]
+
+    changed = False
+    if name and active.name != name:
+        active.name = name
+        changed = True
+    if email and active.email != email:
+        active.email = email
+        changed = True
+    if changed:
+        db.commit()
+    return active
+
+
+def resolve_user(db: Session, sub: str, name: Optional[str], email: Optional[str]) -> models.User:
+    """Back-compat shim: resolve the person's default active membership."""
+    return resolve_active_membership(db, sub, None, name, email)
 
 
 def is_admin(user: models.User) -> bool:
@@ -479,6 +595,29 @@ def _falling_behind(db: Session, ws_id: int) -> list[dict]:
     ][:8]
 
 
+def _user_workspaces(db: Session, user: models.User) -> list[dict]:
+    """Every workspace this person belongs to (drives the switcher), with their role
+    in each. Falls back to just the active membership when there's no clerk_id
+    (auth-disabled dev mode)."""
+    if not user.clerk_id:
+        rows = [user]
+    else:
+        rows = list(
+            db.scalars(
+                select(models.User)
+                .where(models.User.clerk_id == user.clerk_id)
+                .order_by(models.User.id)
+            ).all()
+        )
+    out: list[dict] = []
+    for m in rows:
+        ws = db.get(models.Workspace, m.workspace_id)
+        if ws is None:
+            continue
+        out.append({"id": ws.id, "name": ws.name, "slug": ws.slug or slugify(ws.name), "role": m.role})
+    return out
+
+
 def build_bundle(db: Session, user: models.User, display_name: str) -> dict:
     ws = db.get(models.Workspace, user.workspace_id)
     needs_onboarding = (not ws.onboarded) and is_owner(db, user)
@@ -489,6 +628,8 @@ def build_bundle(db: Session, user: models.User, display_name: str) -> dict:
         "workspace": {"name": ws.name, "plan": ws.plan, "slug": ws.slug or slugify(ws.name)},
         "account": {"name": display_name, "email": user.email, "role": "Workspace owner" if is_admin(user) else user.role},
         "role": user.role,
+        "workspaces": _user_workspaces(db, user),
+        "activeWorkspaceId": user.workspace_id,
         "learner": {
             "name": display_name,
             "firstName": first_name(display_name),

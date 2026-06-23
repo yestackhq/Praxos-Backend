@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import ai, indexing, memory, models, plan as plan_service, workspace
-from ..auth import optional_claims
+from ..auth import active_membership
 from ..db import get_db
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
@@ -42,13 +42,6 @@ class ScoreIn(BaseModel):
     transcript: list[Turn] = []
     moduleIdx: Optional[int] = None
     paused: bool = False  # learner paused mid-section (resume later) vs finished it
-
-
-def _require_user(claims: Optional[dict], db: Session) -> models.User:
-    sub = claims.get("sub") if claims else None
-    if not sub:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sign in required")
-    return workspace.resolve_user(db, sub, None, None)
 
 
 def _doc_in_workspace(db: Session, document_id: int, ws_id: int) -> models.Document:
@@ -133,8 +126,7 @@ def _build_instructions(
 
 
 @router.post("/start")
-def start_session(body: StartIn, claims: Optional[dict] = Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
-    user = _require_user(claims, db)
+def start_session(body: StartIn, user: models.User = Depends(active_membership), db: Session = Depends(get_db)) -> dict:
     doc = _doc_in_workspace(db, body.documentId, user.workspace_id)
     modules = plan_service.get_modules(db, doc.id)
     prog = _progress_row(db, user.id, doc.id)
@@ -196,8 +188,7 @@ def start_session(body: StartIn, claims: Optional[dict] = Depends(optional_claim
 
 
 @router.post("/score")
-def score_session(body: ScoreIn, claims: Optional[dict] = Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
-    user = _require_user(claims, db)
+def score_session(body: ScoreIn, user: models.User = Depends(active_membership), db: Session = Depends(get_db)) -> dict:
     doc = _doc_in_workspace(db, body.documentId, user.workspace_id)
 
     transcript = [{"role": t.role, "text": t.text} for t in body.transcript if t.text.strip()]

@@ -12,7 +12,6 @@ from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
 from .. import memory, models, plan as plan_service, workspace
-from ..auth import optional_claims
 from ..db import get_db
 from .cohorts import _admin, _draft_plans, _seed_path, _seed_progress, _valid_doc_ids, _valid_member_ids
 
@@ -55,8 +54,7 @@ def _set_members(db: Session, team: models.Team, member_ids: list[int]) -> None:
 
 
 @router.post("/teams", status_code=status.HTTP_201_CREATED)
-def create_team(body: TeamIn, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
-    user = _admin(claims, db)
+def create_team(body: TeamIn, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> dict:
     t = models.Team(
         workspace_id=user.workspace_id,
         name=(body.name or "").strip() or "Untitled team",
@@ -75,8 +73,7 @@ def create_team(body: TeamIn, claims=Depends(optional_claims), db: Session = Dep
 
 
 @router.patch("/teams/{tid}")
-def edit_team(tid: int, body: TeamPatch, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
-    user = _admin(claims, db)
+def edit_team(tid: int, body: TeamPatch, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> dict:
     t = _get_team(db, tid, user.workspace_id)
     if body.name is not None and body.name.strip():
         t.name = body.name.strip()
@@ -95,8 +92,7 @@ def edit_team(tid: int, body: TeamPatch, claims=Depends(optional_claims), db: Se
 
 
 @router.delete("/teams/{tid}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_team(tid: int, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> None:
-    user = _admin(claims, db)
+def delete_team(tid: int, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> None:
     t = _get_team(db, tid, user.workspace_id)
     db.execute(delete(models.TeamDocument).where(models.TeamDocument.team_id == t.id))
     db.execute(delete(models.TeamMember).where(models.TeamMember.team_id == t.id))
@@ -105,8 +101,7 @@ def delete_team(tid: int, claims=Depends(optional_claims), db: Session = Depends
 
 
 @router.post("/teams/{tid}/publish")
-def publish_team(tid: int, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
-    user = _admin(claims, db)
+def publish_team(tid: int, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> dict:
     t = _get_team(db, tid, user.workspace_id)
     doc_ids = workspace._team_doc_ids(db, t.id)
     member_ids = workspace._team_member_ids(db, t.id)

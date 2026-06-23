@@ -140,7 +140,7 @@ cython_debug/
 src/.env
 
 # Ignore root files:
-# /Dockerfile (Praxos backend image)
+# /Dockerfile  -- Praxos ships its own backend Dockerfile; keep it tracked.
 /docker-compose.yml
 
 # Don't ignore files inside of script folder:

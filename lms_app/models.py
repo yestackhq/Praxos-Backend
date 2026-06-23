@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import Boolean, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Boolean, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import TypeDecorator
 
@@ -41,13 +41,21 @@ class Workspace(Base):
 
 
 class User(Base):
+    """A person's membership in ONE workspace. A person (Clerk ``clerk_id``) can
+    belong to several workspaces — one row per (clerk_id, workspace_id) — so neither
+    ``clerk_id`` nor ``email`` is globally unique; the pair is. Per-workspace learner
+    data (path items, sessions, progress) keys off this row's ``id``."""
+
     __tablename__ = "users"
+    __table_args__ = (
+        UniqueConstraint("clerk_id", "workspace_id", name="uq_user_clerk_workspace"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    clerk_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True, unique=True)
+    clerk_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True, index=True)
     workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id"))
     name: Mapped[str] = mapped_column(String(120))
-    email: Mapped[str] = mapped_column(String(200), unique=True)
+    email: Mapped[str] = mapped_column(String(200), index=True)
     role: Mapped[str] = mapped_column(String(40), default="Learner")  # Learner | Manager | Admin
     cohort: Mapped[str] = mapped_column(String(120), default="—")
     documents: Mapped[int] = mapped_column(Integer, default=0)

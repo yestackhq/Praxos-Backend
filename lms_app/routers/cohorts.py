@@ -16,19 +16,14 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from .. import memory, models, plan as plan_service, workspace
-from ..auth import optional_claims
+from ..auth import active_membership
 from ..db import get_db
 
 router = APIRouter(prefix="/api", tags=["cohorts"])
 
 
-def _admin(claims: Optional[dict], db: Session) -> models.User:
-    sub = claims.get("sub") if claims else None
-    if not sub:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Sign in required")
-    user = db.scalar(select(models.User).where(models.User.clerk_id == sub))
-    if user is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Unknown user")
+def _admin(user: models.User = Depends(active_membership)) -> models.User:
+    """Dependency: the caller's active-workspace membership, requiring admin there."""
     if not workspace.is_admin(user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only admins can manage cohorts")
     return user
@@ -118,8 +113,7 @@ def _draft_plans(db: Session, doc_ids: list[int]) -> None:
 
 
 @router.post("/cohorts", status_code=status.HTTP_201_CREATED)
-def create_cohort(body: CohortIn, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
-    user = _admin(claims, db)
+def create_cohort(body: CohortIn, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> dict:
     name = (body.name or "").strip() or "Untitled cohort"
     c = models.Cohort(workspace_id=user.workspace_id, name=name, status="Draft", published=False)
     db.add(c)
@@ -136,8 +130,7 @@ def create_cohort(body: CohortIn, claims=Depends(optional_claims), db: Session =
 
 
 @router.patch("/cohorts/{cid}")
-def edit_cohort(cid: int, body: CohortPatch, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
-    user = _admin(claims, db)
+def edit_cohort(cid: int, body: CohortPatch, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> dict:
     c = _get_cohort(db, cid, user.workspace_id)
     if body.name is not None and body.name.strip():
         c.name = body.name.strip()
@@ -156,8 +149,7 @@ def edit_cohort(cid: int, body: CohortPatch, claims=Depends(optional_claims), db
 
 
 @router.delete("/cohorts/{cid}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_cohort(cid: int, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> None:
-    user = _admin(claims, db)
+def delete_cohort(cid: int, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> None:
     c = _get_cohort(db, cid, user.workspace_id)
     db.execute(delete(models.CohortDocument).where(models.CohortDocument.cohort_id == c.id))
     db.execute(delete(models.CohortMember).where(models.CohortMember.cohort_id == c.id))
@@ -168,10 +160,9 @@ def delete_cohort(cid: int, claims=Depends(optional_claims), db: Session = Depen
 
 
 @router.post("/cohorts/{cid}/publish")
-def publish_cohort(cid: int, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
+def publish_cohort(cid: int, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> dict:
     """Push each document's teaching plan + a learning-path seed into every
     member's memory, so the tutor opens already knowing what and how to teach."""
-    user = _admin(claims, db)
     c = _get_cohort(db, cid, user.workspace_id)
     doc_ids = workspace._cohort_doc_ids(db, c.id)
     member_ids = workspace._cohort_member_ids(db, c.id)
@@ -297,16 +288,14 @@ def _own_doc(db: Session, did: int, ws_id: int) -> models.Document:
 
 
 @router.get("/documents/{did}/plan")
-def get_plan(did: int, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
-    user = _admin(claims, db)
+def get_plan(did: int, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> dict:
     doc = _own_doc(db, did, user.workspace_id)
     mods = plan_service.get_modules(db, did)
     return {"document": {"id": doc.id, "name": doc.name}, "modules": [_mod_out(m) for m in mods]}
 
 
 @router.post("/documents/{did}/plan/generate")
-def regenerate_plan(did: int, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
-    user = _admin(claims, db)
+def regenerate_plan(did: int, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> dict:
     doc = _own_doc(db, did, user.workspace_id)
     mods = plan_service.generate_plan(db, did)
     return {"document": {"id": doc.id, "name": doc.name}, "modules": [_mod_out(m) for m in mods]}
@@ -324,10 +313,9 @@ class PlanPatch(BaseModel):
 
 
 @router.patch("/documents/{did}/plan")
-def save_plan(did: int, body: PlanPatch, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
+def save_plan(did: int, body: PlanPatch, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> dict:
     """Save the admin's edited plan. Chunk ranges are carried over by position so
     section-by-section grounding survives a title/topic edit."""
-    user = _admin(claims, db)
     doc = _own_doc(db, did, user.workspace_id)
     old = plan_service.get_modules(db, did)
     db.execute(delete(models.Module).where(models.Module.document_id == did))
@@ -353,9 +341,8 @@ def save_plan(did: int, body: PlanPatch, claims=Depends(optional_claims), db: Se
 
 
 @router.get("/people/{uid}")
-def person_detail(uid: int, claims=Depends(optional_claims), db: Session = Depends(get_db)) -> dict:
+def person_detail(uid: int, admin: models.User = Depends(_admin), db: Session = Depends(get_db)) -> dict:
     """Full detail for one learner — drives the Understanding row sidebar."""
-    admin = _admin(claims, db)
     u = db.get(models.User, uid)
     if u is None or u.workspace_id != admin.workspace_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Person not found")

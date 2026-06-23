@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import models, schemas, workspace
-from ..auth import current_user
+from ..auth import active_membership, current_user
 from ..db import get_db
 
 router = APIRouter(prefix="/api/documents", tags=["documents"], dependencies=[Depends(current_user)])
@@ -19,14 +19,14 @@ def list_documents(db: Session = Depends(get_db)) -> list[schemas.DocumentOut]:
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_document(
-    document_id: int, claims: dict = Depends(current_user), db: Session = Depends(get_db)
+    document_id: int,
+    user: models.User = Depends(active_membership),
+    db: Session = Depends(get_db),
 ) -> None:
     """Remove a document (and its indexed chunks + modules, via cascade). Admins
     only, and only within their own workspace."""
-    sub = claims.get("sub") if claims else None
-    user = workspace.resolve_user(db, sub, None, None) if sub else None
     doc = db.get(models.Document, document_id)
-    if user is None or doc is None or doc.workspace_id != user.workspace_id:
+    if doc is None or doc.workspace_id != user.workspace_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
     if not workspace.is_admin(user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admins can delete documents")

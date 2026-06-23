@@ -42,12 +42,50 @@ def _ensure_columns() -> None:
         conn.execute(text(f"ALTER TABLE {q('modules')} ADD COLUMN IF NOT EXISTS chunk_end integer NOT NULL DEFAULT 0"))
 
 
+def _ensure_membership_schema() -> None:
+    """Self-heal the users table for multi-workspace membership on existing Postgres:
+    drop the old global-unique constraints on email/clerk_id and add the composite
+    (clerk_id, workspace_id) unique + lookup indexes. create_all/_ensure_columns only
+    ADD tables/columns — they never alter constraints, so this closes the gap. Each
+    statement is isolated and idempotent. No-op on SQLite (create_all builds it)."""
+    if engine.dialect.name != "postgresql":
+        return
+    schema = settings.db_schema
+    q = lambda t: f'"{schema}".{t}' if schema else t  # noqa: E731
+    stmts = [
+        f"ALTER TABLE {q('users')} DROP CONSTRAINT IF EXISTS users_email_key",
+        f"ALTER TABLE {q('users')} DROP CONSTRAINT IF EXISTS users_clerk_id_key",
+        f"CREATE INDEX IF NOT EXISTS ix_users_clerk_id ON {q('users')} (clerk_id)",
+        f"CREATE INDEX IF NOT EXISTS ix_users_email ON {q('users')} (email)",
+        "DO $$ BEGIN "
+        "IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_user_clerk_workspace') THEN "
+        f"ALTER TABLE {q('users')} ADD CONSTRAINT uq_user_clerk_workspace UNIQUE (clerk_id, workspace_id); "
+        "END IF; END $$;",
+    ]
+    for sql in stmts:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(sql))
+        except Exception:
+            pass  # best-effort, idempotent self-heal
+
+
 def init_db() -> None:
     """Create tables and seed demo data (idempotent). Alembic owns prod schema."""
     ensure_schema()
     _ensure_pgvector()
     Base.metadata.create_all(bind=engine)
     _ensure_columns()
+    _ensure_membership_schema()
+    # Backfill multi-workspace memberships from accepted invites (idempotent): people
+    # who accepted before this change stop showing as pending and gain their membership.
+    from . import workspace as workspace_svc
+
+    with SessionLocal() as db:
+        try:
+            workspace_svc.reconcile_memberships(db)
+        except Exception:
+            db.rollback()
     if settings.SEED_ON_STARTUP:
         with SessionLocal() as db:
             seed(db)

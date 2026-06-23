@@ -3,10 +3,12 @@ from __future__ import annotations
 from typing import Optional
 
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.orm import Session
 
 from .config import settings
+from .db import get_db
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -46,6 +48,24 @@ async def optional_claims(
         return verify_clerk_token(creds.credentials)
     except Exception:  # noqa: BLE001
         return None
+
+
+def active_membership(
+    x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id"),
+    claims: Optional[dict] = Depends(optional_claims),
+    db: Session = Depends(get_db),
+):
+    """Resolve the signed-in person's ACTIVE workspace membership, selected by the
+    ``X-Workspace-Id`` header (falls back to their default workspace). The header is
+    only a selector — resolution always verifies a real membership, so it can never
+    reach a workspace the person doesn't belong to."""
+    from . import workspace  # lazy import avoids a module-load cycle
+
+    sub = claims.get("sub") if claims else None
+    if not sub:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sign in required")
+    ws_id = int(x_workspace_id) if (x_workspace_id and x_workspace_id.isdigit()) else None
+    return workspace.resolve_active_membership(db, sub, ws_id)
 
 
 async def current_user(
