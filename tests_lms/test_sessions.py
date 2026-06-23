@@ -85,12 +85,47 @@ def test_score_writes_understanding_and_records_session(client, monkeypatch):
         assert body["score"] == 80
         assert body["understanding"] == 80  # first session → equals the score
         assert body["summary"]
-        # A second, lower-scoring session blends understanding downward.
+        # A second, lower-scoring session blends understanding downward. (Substantive
+        # answer so it clears the strict gate and reaches the scorer stub.)
         monkeypatch.setattr(sessions.ai, "score_understanding", lambda d, t: {"score": 40, "topics": []})
         r2 = client.post(
             "/api/sessions/score",
-            json={"documentId": doc["id"], "transcript": [{"role": "learner", "text": "Not sure."}]},
+            json={
+                "documentId": doc["id"],
+                "transcript": [
+                    {"role": "learner", "text": "You report the incident to the IT security team within twenty four hours."}
+                ],
+            },
         ).json()
         assert r2["understanding"] == 60  # round((80 + 40) / 2)
+    finally:
+        _clear()
+
+
+def test_score_gates_thin_or_garbage_answers(client, monkeypatch):
+    """A near-silent / filler answer is scored low WITHOUT calling the LLM, so
+    misrecognised noise can't produce a random high score."""
+    from lms_app.routers import sessions
+
+    def _boom(doc_name, transcript):  # must not be reached for a thin transcript
+        raise AssertionError("score_understanding should not run for a thin transcript")
+
+    monkeypatch.setattr(sessions.ai, "score_understanding", _boom)
+    try:
+        _as({"sub": "gate_owner"})
+        client.post("/api/bootstrap", json={"name": "Gate Owner", "email": "gate@x.dev"})
+        doc = _upload(client)
+        r = client.post(
+            "/api/sessions/score",
+            json={
+                "documentId": doc["id"],
+                "transcript": [
+                    {"role": "tutor", "text": "Explain how to report an incident."},
+                    {"role": "learner", "text": "yeah um ok right"},
+                ],
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["score"] <= 15  # gated low, not a random high score
     finally:
         _clear()

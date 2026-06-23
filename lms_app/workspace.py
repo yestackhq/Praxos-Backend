@@ -163,6 +163,12 @@ def resolve_active_membership(
         memberships = _memberships()
 
     if not memberships:
+        if not eff_email:
+            # No membership and no email yet (Clerk hasn't populated it) — refuse to
+            # fabricate a personal workspace. Doing so would strand an INVITED user on
+            # the create-workspace/onboarding screen (their invite is matched by email).
+            # The client retries once the email is available.
+            raise ValueError("account not ready: email required")
         ws = models.Workspace(name=f"{first_name(eff_name)}'s workspace", plan="Personal workspace")
         db.add(ws)
         db.flush()

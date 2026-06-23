@@ -58,9 +58,13 @@ def bootstrap(
     sub = claims.get("sub") if claims else None
     if not sub:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sign in required")
-    user = workspace.resolve_active_membership(
-        db, sub, _active_ws_id(x_workspace_id), body.name or None, body.email or None
-    )
+    try:
+        user = workspace.resolve_active_membership(
+            db, sub, _active_ws_id(x_workspace_id), body.name or None, body.email or None
+        )
+    except ValueError:
+        # Email not ready yet — tell the client to retry (its bootstrap loop handles it).
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Account not ready, retry")
     return workspace.build_bundle(db, user, body.name or user.name)
 
 

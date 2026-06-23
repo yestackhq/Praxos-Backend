@@ -65,7 +65,10 @@ def active_membership(
     if not sub:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sign in required")
     ws_id = int(x_workspace_id) if (x_workspace_id and x_workspace_id.isdigit()) else None
-    return workspace.resolve_active_membership(db, sub, ws_id)
+    try:
+        return workspace.resolve_active_membership(db, sub, ws_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Account not ready, retry")
 
 
 async def current_user(

@@ -10,6 +10,7 @@ from __future__ import annotations
            score (0-100), writes it back to the learner, and records the session.
 """
 
+import re
 from datetime import date
 from typing import Optional
 
@@ -192,12 +193,31 @@ def score_session(body: ScoreIn, user: models.User = Depends(active_membership),
     doc = _doc_in_workspace(db, body.documentId, user.workspace_id)
 
     transcript = [{"role": t.role, "text": t.text} for t in body.transcript if t.text.strip()]
-    result = ai.score_understanding(doc.name, transcript)
-    if result is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Scoring needs an OpenAI API key on the server.",
-        )
+
+    # Noise-proof gate: if the learner said essentially NOTHING (silence/noise →
+    # empty or pure filler), skip the LLM and score low. Real answers — even short or
+    # numeric ones — go to the strict rubric in score_understanding, which judges them.
+    _filler = {
+        "yeah", "yes", "no", "ok", "okay", "um", "uh", "hmm", "mhm", "mm",
+        "right", "sure", "nope", "yep", "what", "huh", "idk", "dunno", "the", "a", "i",
+    }
+    learner_text = " ".join(t["text"] for t in transcript if t["role"] == "learner")
+    substantive = [w for w in re.findall(r"[a-z0-9']+", learner_text.lower()) if w not in _filler]
+    if not substantive:
+        result = {
+            "score": 10,
+            "summary": "Not enough was said to show understanding — explain the material in your own words.",
+            "topics": [],
+            "strengths": [],
+            "gaps": ["Give a full spoken explanation of the section."],
+        }
+    else:
+        result = ai.score_understanding(doc.name, transcript)
+        if result is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Scoring needs an OpenAI API key on the server.",
+            )
 
     score = result["score"]
     # Blend toward the latest result so understanding tracks the learner over time.

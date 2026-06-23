@@ -45,12 +45,15 @@ def score_understanding(doc_name: str, transcript: list[dict]) -> Optional[dict]
         return None
     convo = "\n".join(f"{t.get('role', '?')}: {t.get('text', '')}" for t in transcript)
     system = (
-        "You are an assessor for a corporate learning platform. A learner was just "
-        f"taught the document '{doc_name}' by a voice tutor and answered questions about it. "
-        "From the transcript, judge how well the learner UNDERSTOOD the material — reward "
-        "correct reasoning in their own words, penalise wrong or absent answers. Be strict "
-        "and noise-proof: ignore filler, mishearings, and the tutor's own statements; score "
-        "only the learner's demonstrated understanding. Respond ONLY as JSON: "
+        "You are a STRICT assessor for a corporate learning platform. A learner was taught "
+        f"the document '{doc_name}' by a voice tutor, then answered questions. Score ONLY the "
+        "LEARNER's turns — completely ignore the tutor's words, and ignore filler, mishearings, "
+        "and transcription noise. Give credit only for correct ideas the learner expresses IN "
+        "THEIR OWN WORDS; never give credit just because the tutor explained something. "
+        "Rubric (0-100): 0-15 = no real answer / filler / off-topic / unintelligible; "
+        "16-40 = vague or mostly wrong; 41-69 = partially correct with clear gaps; "
+        "70-89 = solid, mostly correct; 90-100 = thorough and precise. When in doubt, score LOW. "
+        "Respond ONLY as JSON: "
         '{"score": <int 0-100>, "summary": "<one sentence>", '
         '"topics": [{"name": "<topic>", "score": <int 0-100>}], '
         '"strengths": ["..."], "gaps": ["..."]}'
@@ -159,16 +162,18 @@ def mint_realtime_session(instructions: str) -> Optional[dict]:
                         # Filter steady background noise so the mic doesn't pick up
                         # room hum / keyboard as "speech".
                         "noise_reduction": {"type": "near_field"},
-                        # Server-side voice-activity detection. A higher threshold
-                        # + longer trailing silence stops the tutor from thinking
-                        # the learner is talking when it's just background noise.
+                        # Semantic VAD: a model decides when the learner has actually
+                        # FINISHED a spoken turn, instead of a raw energy threshold. This
+                        # ignores background noise / silence (which a 0.72 server_vad
+                        # threshold kept mis-reading as speech and auto-responding to).
+                        # interrupt_response=False so noise can never cut the tutor off
+                        # mid-word — the tutor finishes its explanation, then the learner
+                        # answers in turn.
                         "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": 0.72,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 900,
+                            "type": "semantic_vad",
+                            "eagerness": "medium",
                             "create_response": True,
-                            "interrupt_response": True,
+                            "interrupt_response": False,
                         },
                     },
                     "output": {"voice": settings.OPENAI_REALTIME_VOICE},
