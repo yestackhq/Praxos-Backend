@@ -158,7 +158,7 @@ def mint_realtime_session(instructions: str) -> Optional[dict]:
                 "instructions": instructions,
                 "audio": {
                     "input": {
-                        "transcription": {"model": "whisper-1"},
+                        "transcription": {"model": settings.OPENAI_TRANSCRIBE_MODEL},
                         # Filter steady background noise so the mic doesn't pick up
                         # room hum / keyboard as "speech".
                         "noise_reduction": {"type": "near_field"},

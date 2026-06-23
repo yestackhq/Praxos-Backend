@@ -106,8 +106,9 @@ def _build_instructions(
             f"\nYou are teaching SECTION {idx + 1} of {len(modules)}: \"{cur.title}\". "
             f"Aim: {cur.description} "
             + (f"Make sure to cover: {topics}. " if topics else "")
-            + "Teach ONLY this section right now. When the learner has clearly understood it, tell "
-            "them they've completed this section and can move on to the next one."
+            + "Teach ONLY this section right now. Only AFTER the learner has correctly EXPLAINED this "
+            "section's idea in their own words (not merely agreed or thanked you) tell them they've "
+            "completed it and can move on to the next one."
         )
         if resumed:
             section_block += (
@@ -117,11 +118,17 @@ def _build_instructions(
             )
 
     return (
-        f"You are Praxos, a warm, concise voice tutor teaching '{doc.name}'. Teach conversationally "
-        "in short turns: explain a key point, then ask a question to check understanding. Listen, "
-        "give brief feedback, and move on. Stay strictly within the material below. Keep replies "
-        "under three sentences. IMPORTANT: speak FIRST the moment the session begins — greet the "
-        "learner and start teaching right away; never sit silently waiting for them to talk."
+        f"You are Praxos, a warm but RIGOROUS voice tutor teaching '{doc.name}'. Teach "
+        "conversationally in short turns: explain a key point, then ask a question that makes the "
+        "learner EXPLAIN the idea in their own words. Stay strictly within the material below. Keep "
+        "replies under three sentences. Speak FIRST the moment the session begins — greet the learner "
+        "and start teaching right away; never sit silently waiting for them to talk.\n"
+        "RIGOR (critical): acknowledgements and filler are NOT answers. If the learner only says "
+        "things like 'thank you', 'ok', 'yeah', 'mm', 'right', 'got it', stays silent, gives a single "
+        "word, or says something off-topic or that sounds like stray background speech, do NOT say "
+        "'exactly/right/correct', do NOT give credit, and do NOT move on. Warmly ask them to explain "
+        "it in their own words, or re-ask more specifically. If you're unsure you heard a real answer, "
+        "ask them to repeat it."
         f"{memory_block}{plan_block}{section_block}"
         f"\n--- SECTION MATERIAL ---\n{context}"
     )
@@ -221,6 +228,7 @@ def score_session(body: ScoreIn, user: models.User = Depends(active_membership),
     _filler = {
         "yeah", "yes", "no", "ok", "okay", "um", "uh", "hmm", "mhm", "mm",
         "right", "sure", "nope", "yep", "what", "huh", "idk", "dunno", "the", "a", "i",
+        "thank", "thanks", "you", "thankyou", "please",
     }
     learner_text = " ".join(t["text"] for t in transcript if t["role"] == "learner")
     substantive = [w for w in re.findall(r"[a-z0-9']+", learner_text.lower()) if w not in _filler]
