@@ -163,17 +163,17 @@ def mint_realtime_session(instructions: str) -> Optional[dict]:
                         # room hum / keyboard as "speech".
                         "noise_reduction": {"type": "near_field"},
                         # Semantic VAD: a model decides when the learner has actually
-                        # FINISHED a spoken turn, instead of a raw energy threshold. This
-                        # ignores background noise / silence (which a 0.72 server_vad
-                        # threshold kept mis-reading as speech and auto-responding to).
-                        # interrupt_response=False so noise can never cut the tutor off
-                        # mid-word — the tutor finishes its explanation, then the learner
-                        # answers in turn.
+                        # FINISHED a spoken turn (not a raw energy threshold), so background
+                        # noise/silence doesn't trigger it. eagerness=low → it waits through
+                        # the learner's mid-sentence PAUSES instead of cutting in early.
+                        # interrupt_response=True → if the learner keeps talking over a reply
+                        # it cleanly restarts the turn, instead of leaving an active response
+                        # that blocks the next one (which deadlocked the session).
                         "turn_detection": {
                             "type": "semantic_vad",
-                            "eagerness": "medium",
+                            "eagerness": "low",
                             "create_response": True,
-                            "interrupt_response": False,
+                            "interrupt_response": True,
                         },
                     },
                     "output": {"voice": settings.OPENAI_REALTIME_VOICE},
