@@ -36,6 +36,18 @@ def first_name(name: Optional[str]) -> str:
     return (name or "there").strip().split(" ")[0] or "there"
 
 
+def _display_name(email: Optional[str]) -> str:
+    """A human-ish name from an email local-part, used only when no real name was
+    provided — so a new user is never labelled 'New user' / 'there'."""
+    if email and "@" in email:
+        local = email.split("@", 1)[0]
+        parts = [p for p in re.split(r"[._+-]+", local) if p]
+        derived = " ".join(p.capitalize() for p in parts)
+        if derived:
+            return derived
+    return "New user"
+
+
 def _ensure_membership(
     db: Session, sub: str, ws_id: int, email: Optional[str], name: Optional[str], role: str
 ) -> bool:
@@ -157,7 +169,9 @@ def resolve_active_membership(
 
     memberships = _memberships()
     eff_email = email or (memberships[0].email if memberships else None)
-    eff_name = name or (memberships[0].name if memberships else None)
+    # Real name if given, else the existing one, else a sensible name from the email
+    # (never "New user"/"there").
+    eff_name = name or (memberships[0].name if memberships else None) or _display_name(eff_email)
 
     if apply_pending_invites(db, sub, eff_email, eff_name):
         memberships = _memberships()

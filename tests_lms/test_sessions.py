@@ -85,8 +85,8 @@ def test_score_writes_understanding_and_records_session(client, monkeypatch):
         assert body["score"] == 80
         assert body["understanding"] == 80  # first session → equals the score
         assert body["summary"]
-        # A second, lower-scoring session blends understanding downward. (Substantive
-        # answer so it clears the strict gate and reaches the scorer stub.)
+        # A second session REPLACES understanding with the latest score (so re-learning
+        # updates it). Substantive answer so it clears the strict gate and reaches the stub.
         monkeypatch.setattr(sessions.ai, "score_understanding", lambda d, t: {"score": 40, "topics": []})
         r2 = client.post(
             "/api/sessions/score",
@@ -97,7 +97,7 @@ def test_score_writes_understanding_and_records_session(client, monkeypatch):
                 ],
             },
         ).json()
-        assert r2["understanding"] == 60  # round((80 + 40) / 2)
+        assert r2["understanding"] == 40  # latest attempt replaces — re-learning updates the score
     finally:
         _clear()
 

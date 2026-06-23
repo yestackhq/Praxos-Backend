@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Header, HTTPException, UploadFile, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -143,8 +143,26 @@ def add_document(body: DocumentIn, user: models.User = Depends(active_membership
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50MB, matches the UI copy
 
 
+def _index_in_background(doc_id: int, data: bytes) -> None:
+    """Extract + chunk + embed a freshly-uploaded PDF OFF the request path, so the
+    upload returns immediately (the doc shows as 'Indexing' and flips to 'Indexed'
+    when this finishes). Uses its own DB session."""
+    from ..db import SessionLocal
+
+    with SessionLocal() as db:
+        doc = db.get(models.Document, doc_id)
+        if doc is None:
+            return
+        try:
+            indexing.index_document(db, doc, data)
+        except Exception:
+            doc.status = "Failed"
+            db.commit()
+
+
 @router.post("/documents/upload", status_code=status.HTTP_201_CREATED)
 async def upload_document(
+    background: BackgroundTasks,
     file: UploadFile = File(...),
     storage_path: Optional[str] = Form(None),
     user: models.User = Depends(active_membership),
@@ -175,8 +193,9 @@ async def upload_document(
     db.commit()
     db.refresh(doc)
 
-    indexing.index_document(db, doc, data)
-    db.refresh(doc)
+    # Index off the request path so the upload returns immediately; the doc shows as
+    # "Indexing" and flips to "Indexed" once embedding finishes.
+    background.add_task(_index_in_background, doc.id, data)
     return {
         "id": doc.id,
         "name": doc.name,

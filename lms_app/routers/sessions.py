@@ -31,6 +31,7 @@ MAX_CONTEXT_CHARS = 6000
 class StartIn(BaseModel):
     documentId: int
     moduleIdx: Optional[int] = None  # explicit section; else resume at the saved point
+    restart: bool = False  # re-learn from the first section (reset saved progress)
 
 
 class Turn(BaseModel):
@@ -132,8 +133,28 @@ def start_session(body: StartIn, user: models.User = Depends(active_membership),
     modules = plan_service.get_modules(db, doc.id)
     prog = _progress_row(db, user.id, doc.id)
 
-    # Which section to teach: an explicit override, else the saved resume point.
-    if body.moduleIdx is not None:
+    # Re-learn: reset saved progress + re-open the path item, so a learner can redo a
+    # mastered or low-scoring document from the first section to raise their understanding.
+    if body.restart:
+        if prog is not None:
+            prog.module_idx = 0
+            prog.status = "in_progress"
+            prog.score = None
+        item = db.scalar(
+            select(models.LearningPathItem).where(
+                models.LearningPathItem.user_id == user.id,
+                models.LearningPathItem.title == doc.name,
+            )
+        )
+        if item is not None and item.status == "mastered":
+            item.status = "in_progress"
+            item.progress = 0
+        db.flush()
+
+    # Which section to teach: restart → first; an explicit override; else the saved point.
+    if body.restart:
+        idx = 0
+    elif body.moduleIdx is not None:
         idx = body.moduleIdx
     elif prog is not None:
         idx = prog.module_idx
@@ -220,8 +241,9 @@ def score_session(body: ScoreIn, user: models.User = Depends(active_membership),
             )
 
     score = result["score"]
-    # Blend toward the latest result so understanding tracks the learner over time.
-    user.understanding = score if user.understanding == 0 else round((user.understanding + score) / 2)
+    # Understanding reflects the learner's LATEST attempt — so re-learning a document
+    # immediately raises (or lowers) it, instead of being capped by an average.
+    user.understanding = score
     learner_turns = sum(1 for t in transcript if t["role"] == "learner")
     session_row = models.LearningSession(
         user_id=user.id,

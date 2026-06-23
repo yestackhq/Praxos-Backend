@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # For Supabase: postgresql+psycopg://postgres.<ref>:<pwd>@<host>:5432/postgres
     DATABASE_URL: str = "sqlite:///./praxos_lms.db"
 
-    SEED_ON_STARTUP: bool = True
+    SEED_ON_STARTUP: bool = False  # demo seed only when explicitly enabled (never in prod)
     CORS_ORIGINS: str = "http://localhost:5173"
 
     # Where invited users land after accepting a Clerk invitation.

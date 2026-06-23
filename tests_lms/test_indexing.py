@@ -82,11 +82,13 @@ def test_upload_pdf_indexes_and_appears(client):
         )
         assert r.status_code == 201, r.text
         body = r.json()
-        assert body["status"] == "Indexed"
-        assert body["sections"] >= 1
-        # Shows up in the workspace bundle.
+        assert body["status"] == "Indexing"  # indexing now runs in a background task
+        # The background task completes; it appears Indexed (with sections) in the bundle.
         b = client.post("/api/bootstrap", json={"name": "Upl Owner", "email": "upl@x.dev"}).json()
-        assert "code-of-conduct.pdf" in [d["name"] for d in b["admin"]["documents"]]
+        docs = {d["name"]: d for d in b["admin"]["documents"]}
+        assert "code-of-conduct.pdf" in docs
+        assert docs["code-of-conduct.pdf"]["status"] == "Indexed"
+        assert docs["code-of-conduct.pdf"]["sections"] >= 1
     finally:
         _clear()
 
