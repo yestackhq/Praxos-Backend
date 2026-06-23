@@ -464,6 +464,7 @@ def _continue_learning(db: Session, user: models.User) -> Optional[dict]:
     doc = _doc_by_name(db, user.workspace_id, item.title)
     total = item.sections
     cur = 1
+    doc_score = user.understanding  # comprehension score for this doc (latest), fallback
     if doc is not None:
         total = (
             db.scalar(
@@ -478,12 +479,16 @@ def _continue_learning(db: Session, user: models.User) -> Optional[dict]:
             )
         )
         cur = (prog.module_idx + 1) if prog else 1
+        if prog is not None and prog.score is not None:
+            doc_score = prog.score
     started = (item.progress or 0) > 0
     return {
         "doc": clean_name(item.title),
         "position": f"Section {min(cur, total)} of {total}" if total else "Ready to start",
         "remaining": "Pick up where you left off." if started else "Start your first section.",
-        "understanding": item.progress if item.progress is not None else user.understanding,
+        # understanding = comprehension SCORE (not section %); progress = % of sections done.
+        "understanding": doc_score,
+        "progress": item.progress if item.progress is not None else 0,
         "docId": doc.id if doc else None,
     }
 
