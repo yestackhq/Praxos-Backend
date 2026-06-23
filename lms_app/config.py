@@ -47,9 +47,10 @@ class Settings(BaseSettings):
     OPENAI_CHAT_MODEL: str = "gpt-4o"
     OPENAI_REALTIME_MODEL: str = "gpt-realtime-2"
     OPENAI_REALTIME_VOICE: str = "marin"
-    # gpt-4o transcribe models hallucinate far less on silence/noise than whisper-1
-    # (which invents "Thank you" etc. from quiet audio). Tunable without a code change.
-    OPENAI_TRANSCRIBE_MODEL: str = "gpt-4o-mini-transcribe"
+    # Realtime input transcription. gpt-realtime-whisper is OpenAI's streaming STT purpose-
+    # built for realtime (verified accepted by the realtime session); far less silence
+    # hallucination than whisper-1's "Thank you" artifacts. Tunable without a code change.
+    OPENAI_TRANSCRIBE_MODEL: str = "gpt-realtime-whisper"
 
     # NOTE: original-PDF storage is handled CLIENT-SIDE — the browser uploads
     # straight to Supabase Storage with the publishable key (see web/src/lib/
