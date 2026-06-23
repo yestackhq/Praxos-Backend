@@ -247,19 +247,24 @@ def _people(db: Session, ws_id: int) -> list[dict]:
         select(models.User).where(models.User.workspace_id == ws_id).order_by(models.User.id)
     ).all()
     team_of = _user_team_map(db, ws_id)
-    return [
-        {
-            "name": u.name,
-            "email": u.email,
-            "cohort": u.cohort,
-            "team": team_of.get(u.id, ""),
-            "documents": u.documents,
-            "understanding": u.understanding,
-            "role": u.role,
-            "id": u.id,
-        }
-        for u in users
-    ]
+    out: list[dict] = []
+    for u in users:
+        score = _user_understanding(db, u.id)
+        out.append(
+            {
+                "name": u.name,
+                "email": u.email,
+                "cohort": u.cohort,
+                "team": team_of.get(u.id, ""),
+                "documents": u.documents,
+                # Recency-weighted (EMA) over the learner's attempts, not the last score.
+                "understanding": score or 0,
+                "band": understanding_band(score),
+                "role": u.role,
+                "id": u.id,
+            }
+        )
+    return out
 
 
 def _pending(db: Session, ws_id: int) -> list[dict]:
@@ -298,6 +303,7 @@ def cohort_detail(db: Session, c: models.Cohort) -> dict:
         for d in (db.get(models.Document, did) for did in doc_ids)
         if d is not None
     ]
+    cu = _cohort_understanding(db, c.id)
     return {
         "id": c.id,
         "name": c.name,
@@ -307,7 +313,10 @@ def cohort_detail(db: Session, c: models.Cohort) -> dict:
         "documents": docs,
         "status": c.status,
         "published": c.published,
-        "avg": c.avg,
+        # Cohort-scoped, recency-weighted understanding (was the stale stored c.avg).
+        "avg": cu or 0,
+        "understanding": cu or 0,
+        "band": understanding_band(cu),
         "completion": c.completion,
     }
 
@@ -537,6 +546,84 @@ def _understanding_series(db: Session, ws_id: int) -> list[dict]:
     return [{"date": d or "", "score": int(s or 0)} for d, s in rows]
 
 
+# ---- Cohort-scoped, recency-weighted understanding (EMA) ----------------------
+# Each session writes a 0-100 LearningSession score for a section. We aggregate those
+# with an exponential moving average (recent attempts weighted more) so re-learning
+# raises the number quickly while a single noisy score doesn't whipsaw it, then scope
+# the average to a cohort's documents. See the scoring rationale discussion.
+
+_EMA_ALPHA = 0.5  # weight on the latest attempt; older attempts decay
+
+
+def understanding_band(score: Optional[int]) -> str:
+    """Proficiency band for an understanding score (corporate-competency style)."""
+    if score is None:
+        return "Not started"
+    if score >= 90:
+        return "Mastered"
+    if score >= 70:
+        return "Proficient"
+    if score >= 40:
+        return "Progressing"
+    return "Developing"
+
+
+def _doc_ema(db: Session, user_id: int, doc_name: str) -> Optional[int]:
+    """Recency-weighted (EMA) understanding for one learner on one document, replayed
+    from their session-score history (recent attempts weighted more). Ignores 0s
+    (no-answer/failed runs). None when there is no scored attempt."""
+    scores = db.scalars(
+        select(models.LearningSession.score)
+        .where(models.LearningSession.user_id == user_id, models.LearningSession.doc == doc_name)
+        .order_by(models.LearningSession.id)
+    ).all()
+    ema: Optional[float] = None
+    for s in scores:
+        if not s or s <= 0:
+            continue
+        ema = float(s) if ema is None else _EMA_ALPHA * s + (1 - _EMA_ALPHA) * ema
+    return round(ema) if ema is not None else None
+
+
+def _cohort_doc_names(db: Session, cohort_id: int) -> list[str]:
+    docs = (db.get(models.Document, did) for did in _cohort_doc_ids(db, cohort_id))
+    return [d.name for d in docs if d is not None]
+
+
+def _scoped_understanding(db: Session, user_id: int, doc_names: list[str]) -> Optional[int]:
+    """A learner's understanding scoped to a set of documents (e.g. a cohort's docs):
+    the average of their per-document EMA over the docs they have actually attempted."""
+    emas = [e for e in (_doc_ema(db, user_id, n) for n in doc_names) if e is not None]
+    return round(sum(emas) / len(emas)) if emas else None
+
+
+def _user_understanding(db: Session, user_id: int) -> Optional[int]:
+    """Overall recency-weighted understanding across every document the learner has
+    attempted (workspace People table)."""
+    names = list(
+        db.scalars(
+            select(models.LearningSession.doc)
+            .where(models.LearningSession.user_id == user_id)
+            .distinct()
+        ).all()
+    )
+    return _scoped_understanding(db, user_id, names)
+
+
+def _cohort_understanding(db: Session, cohort_id: int) -> Optional[int]:
+    """Average cohort-scoped understanding across the cohort's members (EMA over the
+    cohort's documents only)."""
+    doc_names = _cohort_doc_names(db, cohort_id)
+    if not doc_names:
+        return None
+    vals = [
+        v
+        for v in (_scoped_understanding(db, uid, doc_names) for uid in _cohort_member_ids(db, cohort_id))
+        if v is not None
+    ]
+    return round(sum(vals) / len(vals)) if vals else None
+
+
 def _avg_understanding(db: Session, user_ids: list[int]) -> int:
     """Average understanding over the MEASURED members of a group (those with a
     score > 0). 0 when nobody in the group has been measured yet."""
@@ -553,7 +640,8 @@ def _avg_understanding(db: Session, user_ids: list[int]) -> int:
 def _understanding_kpis(db: Session, ws_id: int) -> list[dict]:
     """Real, workspace-scoped headline numbers for the Understanding page."""
     users = list(db.scalars(select(models.User).where(models.User.workspace_id == ws_id)).all())
-    measured = [u.understanding for u in users if u.understanding and u.understanding > 0]
+    per_user = [_user_understanding(db, u.id) for u in users]  # recency-weighted (EMA)
+    measured = [v for v in per_user if v is not None]
     avg = round(sum(measured) / len(measured)) if measured else 0
     docs = (
         db.scalar(select(func.count()).select_from(models.Document).where(models.Document.workspace_id == ws_id))
@@ -588,12 +676,13 @@ def _understanding_kpis(db: Session, ws_id: int) -> list[dict]:
 
 
 def _cohort_health(db: Session, ws_id: int) -> list[dict]:
-    return [
-        {"name": c.name, "value": _avg_understanding(db, _cohort_member_ids(db, c.id)), "pct": c.completion}
-        for c in db.scalars(
-            select(models.Cohort).where(models.Cohort.workspace_id == ws_id).order_by(models.Cohort.id)
-        ).all()
-    ]
+    out: list[dict] = []
+    for c in db.scalars(
+        select(models.Cohort).where(models.Cohort.workspace_id == ws_id).order_by(models.Cohort.id)
+    ).all():
+        cu = _cohort_understanding(db, c.id)  # cohort-scoped, recency-weighted
+        out.append({"name": c.name, "value": cu or 0, "band": understanding_band(cu), "pct": c.completion})
+    return out
 
 
 def _team_health(db: Session, ws_id: int) -> list[dict]:
@@ -606,18 +695,19 @@ def _team_health(db: Session, ws_id: int) -> list[dict]:
 
 
 def _falling_behind(db: Session, ws_id: int) -> list[dict]:
-    users = db.scalars(
-        select(models.User).where(models.User.workspace_id == ws_id).order_by(models.User.understanding)
-    ).all()
-    return [
-        {
-            "name": u.name,
-            "cohort": u.cohort if u.cohort and u.cohort != "—" else "No cohort",
-            "score": u.understanding,
-        }
-        for u in users
-        if u.understanding and 0 < u.understanding < 55
-    ][:8]
+    users = db.scalars(select(models.User).where(models.User.workspace_id == ws_id)).all()
+    out: list[dict] = []
+    for u in users:
+        score = _user_understanding(db, u.id)  # recency-weighted (EMA)
+        if score is not None and 0 < score < 55:
+            out.append(
+                {
+                    "name": u.name,
+                    "cohort": u.cohort if u.cohort and u.cohort != "—" else "No cohort",
+                    "score": score,
+                }
+            )
+    return sorted(out, key=lambda x: x["score"])[:8]
 
 
 def _user_workspaces(db: Session, user: models.User) -> list[dict]:
