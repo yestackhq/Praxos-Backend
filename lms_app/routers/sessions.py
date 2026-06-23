@@ -76,20 +76,26 @@ def _build_instructions(
     idx: int,
     recap: str = "",
     resumed: bool = False,
+    advancing: bool = False,
 ) -> str:
     cur = modules[idx] if modules and 0 <= idx < len(modules) else None
     context = "\n\n".join(_section_chunks(doc, cur))[:MAX_CONTEXT_CHARS]
 
-    if recap:
+    if advancing:
+        memory_block = (
+            "\n\nThe learner just finished the previous section. In ONE sentence recap what it "
+            "covered, then immediately start teaching THIS section. Do not greet or re-introduce yourself.\n"
+        )
+    elif recap:
         memory_block = (
             f"\n\n{recap}\n"
-            "You have taught this learner before. Greet them by name and give a one-line recap, "
-            "then continue. Build on their strengths and gently revisit their gaps.\n"
+            "You have taught this learner before. Do NOT introduce yourself. Give a ONE-line recap of "
+            "where they left off, then continue teaching this section.\n"
         )
     else:
         memory_block = (
-            "\n\nThis is your first session with this learner on this document. Briefly introduce "
-            "yourself, then begin teaching the current section.\n"
+            "\n\nStart teaching THIS section directly — do NOT introduce yourself or summarise the "
+            "document. Open with the first key point and a question.\n"
         )
 
     plan_block = ""
@@ -106,10 +112,23 @@ def _build_instructions(
             f"\nYou are teaching SECTION {idx + 1} of {len(modules)}: \"{cur.title}\". "
             f"Aim: {cur.description} "
             + (f"Make sure to cover: {topics}. " if topics else "")
-            + "Teach ONLY this section right now. Only AFTER the learner has correctly EXPLAINED this "
-            "section's idea in their own words (not merely agreed or thanked you) tell them they've "
-            "completed it and can move on to the next one."
+            + "Teach ONLY this section now. When the learner has correctly EXPLAINED this section's "
+            "idea in their own words (not merely agreed or thanked you), CALL the "
+            "`ready_for_next_section` tool AND, in that same turn, tell them out loud in one short "
+            "sentence that they've completed this section and can tap the on-screen button to "
+            "continue whenever they're ready. NEVER call the tool silently — always speak. Keep "
+            "teaching and probing until they can explain it. You CANNOT switch sections yourself — "
+            "only the learner's on-screen button advances. So if, after you've signalled readiness, "
+            "the learner says they want to move on, simply and warmly tell them to tap the button "
+            "(e.g. 'Tap Next section and we'll dive right in') — never say you 'can't', never "
+            "apologise, and never promise to teach the next section in this turn. If they keep "
+            "discussing THIS section, keep helping."
         )
+        if modules and idx >= len(modules) - 1:
+            section_block += (
+                " This is the FINAL section: once they understand it, briefly wrap up the whole "
+                "document in a sentence or two, then call `ready_for_next_section`."
+            )
         if resumed:
             section_block += (
                 " The learner PAUSED partway through this section last time — recall from your "
@@ -120,15 +139,21 @@ def _build_instructions(
     return (
         f"You are Praxos, a warm but RIGOROUS voice tutor teaching '{doc.name}'. Teach "
         "conversationally in short turns: explain a key point, then ask a question that makes the "
-        "learner EXPLAIN the idea in their own words. Stay strictly within the material below. Keep "
-        "replies under three sentences. Speak FIRST the moment the session begins — greet the learner "
-        "and start teaching right away; never sit silently waiting for them to talk.\n"
+        "learner EXPLAIN the idea in their own words. Ground your teaching in the SECTION MATERIAL "
+        "below; explain it in your own words and use general knowledge only to clarify or give "
+        "everyday examples, never to add facts that contradict it. You ALWAYS have the material you "
+        "need — NEVER claim a section's text is missing or unavailable, and NEVER ask the learner to "
+        "paste, type, share, upload, or provide any document, section, or text (this is a voice "
+        "conversation; they cannot send you text). If a section's material is brief, just teach the "
+        "concept it states concisely. Keep replies under three sentences. Speak FIRST the moment the "
+        "session begins — start teaching immediately; do NOT introduce yourself or greet at length; "
+        "never sit silently.\n"
         "RIGOR (critical): acknowledgements and filler are NOT answers. If the learner only says "
         "things like 'thank you', 'ok', 'yeah', 'mm', 'right', 'got it', stays silent, gives a single "
         "word, or says something off-topic or that sounds like stray background speech, do NOT say "
-        "'exactly/right/correct', do NOT give credit, and do NOT move on. Warmly ask them to explain "
-        "it in their own words, or re-ask more specifically. If you're unsure you heard a real answer, "
-        "ask them to repeat it."
+        "'exactly/right/correct', do NOT give credit, do NOT call the tool, and do NOT move on. Ask "
+        "them to explain it in their own words, or re-ask. If unsure you heard a real answer, ask "
+        "them to repeat it."
         f"{memory_block}{plan_block}{section_block}"
         f"\n--- SECTION MATERIAL ---\n{context}"
     )
@@ -212,7 +237,31 @@ def start_session(body: StartIn, user: models.User = Depends(active_membership),
         "moduleIdx": idx,
         "moduleTitle": modules[idx].title if modules else None,
         "totalModules": len(modules),
+        "isLast": idx >= len(modules) - 1 if modules else True,
         "resumed": resumed,
+    }
+
+
+class SectionIn(BaseModel):
+    documentId: int
+    moduleIdx: int
+
+
+@router.post("/section")
+def section_instructions(body: SectionIn, user: models.User = Depends(active_membership), db: Session = Depends(get_db)) -> dict:
+    """Instructions for advancing to a section MID-session — the client sends these via a
+    realtime session.update so the tutor moves on WITHOUT reconnecting (keeps context, no
+    re-intro). Recap framing is baked in (advancing=True)."""
+    doc = _doc_in_workspace(db, body.documentId, user.workspace_id)
+    modules = plan_service.get_modules(db, doc.id)
+    idx = max(0, min(body.moduleIdx, max(0, len(modules) - 1)))
+    cur = modules[idx] if modules else None
+    return {
+        "moduleIdx": idx,
+        "moduleTitle": cur.title if cur else None,
+        "totalModules": len(modules),
+        "isLast": idx >= len(modules) - 1 if modules else True,
+        "instructions": _build_instructions(doc, modules, idx, advancing=True),
     }
 
 

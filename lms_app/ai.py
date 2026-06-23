@@ -135,6 +135,23 @@ def generate_lesson_plan(doc_name: str, chunks: list[str]) -> Optional[list[dict
     return out or None
 
 
+# The tutor calls this once the learner has demonstrated the current section; the client
+# turns it into the "Next section" button (so the learner advances without restarting).
+_TUTOR_TOOLS = [
+    {
+        "type": "function",
+        "name": "ready_for_next_section",
+        "description": (
+            "Call this the moment the learner has correctly EXPLAINED the current section in "
+            "their own words and is ready to move on. It reveals the learner's 'Next section' "
+            "button. Never call it for acknowledgements, filler, or silence — only after a real "
+            "explanation."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }
+]
+
+
 def mint_realtime_session(instructions: str) -> Optional[dict]:
     """Create an ephemeral Realtime client secret the browser uses to open a
     WebRTC voice connection directly to OpenAI (the key never reaches the client).
@@ -156,6 +173,8 @@ def mint_realtime_session(instructions: str) -> Optional[dict]:
                 "type": "realtime",
                 "model": settings.OPENAI_REALTIME_MODEL,
                 "instructions": instructions,
+                "tools": _TUTOR_TOOLS,
+                "tool_choice": "auto",
                 "audio": {
                     "input": {
                         "transcription": {"model": settings.OPENAI_TRANSCRIBE_MODEL},
