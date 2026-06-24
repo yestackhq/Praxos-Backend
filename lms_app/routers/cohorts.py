@@ -171,6 +171,11 @@ def publish_cohort(cid: int, user: models.User = Depends(_admin), db: Session = 
             status.HTTP_400_BAD_REQUEST,
             "Add at least one document and one learner before publishing.",
         )
+    # A cohort's FIRST publish (draft → published) is a fresh assignment: documents a learner has
+    # already COMPLETED are re-opened so they re-learn them in this cohort. Re-publishing an
+    # already-published cohort (e.g. after editing the plan or adding a doc) stays non-destructive,
+    # so completed learners aren't forced to redo everything.
+    fresh = not c.published
     for did in doc_ids:
         mods = plan_service.ensure_plan(db, did)
         doc = db.get(models.Document, did)
@@ -191,8 +196,17 @@ def publish_cohort(cid: int, user: models.User = Depends(_admin), db: Session = 
                 )
             except Exception:  # memory push is best-effort
                 pass
-            _seed_path(db, uid, doc, len(mods))
-            _seed_progress(db, uid, did)
+            item = db.scalar(
+                select(models.LearningPathItem).where(
+                    models.LearningPathItem.user_id == uid,
+                    models.LearningPathItem.title == doc.name,
+                )
+            )
+            # Re-open only a COMPLETED document, and only on a fresh publish — so in-progress work
+            # and routine re-publishes are never wiped.
+            reopen = fresh and item is not None and item.status == "mastered"
+            _seed_path(db, uid, doc, len(mods), reopen=reopen)
+            _seed_progress(db, uid, did, reopen=reopen)
         doc.assigned = len(member_ids)
     c.published = True
     c.status = "On track"
@@ -201,7 +215,7 @@ def publish_cohort(cid: int, user: models.User = Depends(_admin), db: Session = 
     return workspace.cohort_detail(db, c)
 
 
-def _seed_path(db: Session, user_id: int, doc: models.Document, sections: int) -> None:
+def _seed_path(db: Session, user_id: int, doc: models.Document, sections: int, reopen: bool = False) -> None:
     """Add the document to a learner's learning path (idempotent by title)."""
     existing = db.scalar(
         select(models.LearningPathItem).where(
@@ -210,10 +224,13 @@ def _seed_path(db: Session, user_id: int, doc: models.Document, sections: int) -
         )
     )
     if existing is not None:
-        # Already on this learner's path — keep their status/progress; only refresh
-        # the section count. This is what makes re-publishing (after adding a new
-        # doc) NON-destructive to what they've already learnt.
         existing.sections = sections
+        if reopen:
+            # Fresh publish re-opens a completed document for another pass (past scores are kept).
+            existing.status = "up_next"
+            existing.progress = 0
+        # Otherwise keep their status/progress — this is what makes re-publishing (after adding a
+        # new doc) NON-destructive to what they've already learnt.
         return
     count = (
         db.scalar(
@@ -246,8 +263,9 @@ def _seed_path(db: Session, user_id: int, doc: models.Document, sections: int) -
     )
 
 
-def _seed_progress(db: Session, user_id: int, document_id: int) -> None:
-    """Seed section 0 as the resume point (idempotent)."""
+def _seed_progress(db: Session, user_id: int, document_id: int, reopen: bool = False) -> None:
+    """Seed section 0 as the resume point (idempotent). On a fresh publish of a completed
+    document (``reopen``), reset the resume point back to the first section."""
     existing = db.scalar(
         select(models.SectionProgress).where(
             models.SectionProgress.user_id == user_id,
@@ -260,6 +278,10 @@ def _seed_progress(db: Session, user_id: int, document_id: int) -> None:
                 user_id=user_id, document_id=document_id, module_idx=0, status="in_progress"
             )
         )
+    elif reopen:
+        existing.module_idx = 0
+        existing.status = "in_progress"
+        existing.score = None
 
 
 # ---------------------------------------------------------------------------
