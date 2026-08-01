@@ -37,8 +37,8 @@ def test_extract_and_chunk():
     assert chunk_text("") == []
 
 
-def test_retrieve_falls_back_to_keywords_without_openai():
-    # No OpenAI key in tests → no embeddings → keyword overlap retrieval.
+def test_retrieve_falls_back_to_keywords_without_openai(client):  # client creates the schema
+    # No embedding provider in tests → keyword overlap retrieval.
     from lms_app.db import SessionLocal
     from lms_app import indexing, models
 
@@ -52,7 +52,7 @@ def test_retrieve_falls_back_to_keywords_without_openai():
         n = indexing.index_document(db, doc, _minimal_pdf("Reset your password regularly. Phishing emails are a threat."))
         assert n >= 1
         assert doc.status == "Indexed"
-        assert doc.sections == n
+        assert doc.chunk_count == n
         hits = indexing.retrieve(db, doc.id, "how do I handle phishing", k=2)
         assert hits and any("Phishing" in h or "phishing" in h for h in hits)
 
@@ -88,7 +88,7 @@ def test_upload_pdf_indexes_and_appears(client):
         docs = {d["name"]: d for d in b["admin"]["documents"]}
         assert "code-of-conduct.pdf" in docs
         assert docs["code-of-conduct.pdf"]["status"] == "Indexed"
-        assert docs["code-of-conduct.pdf"]["sections"] >= 1
+        assert docs["code-of-conduct.pdf"]["chunks"] >= 1
     finally:
         _clear()
 

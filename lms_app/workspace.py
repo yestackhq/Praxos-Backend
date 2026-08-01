@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+"""Workspace membership + the single read-model the app renders from.
+
+Every understanding number here comes from ``scoring.py``. Nothing is cached on
+a row any more: the People table, cohort health, the trend chart and the
+learner's own dashboard all recompute from ``section_progress``, so the admin
+and the learner can never see two different numbers for the same person.
+"""
+
 import re
 from typing import Optional
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import models
+from . import models, scoring
+from .config import settings
 
 
 def clean_name(name: str) -> str:
@@ -23,14 +32,6 @@ def slugify(value: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
     return s[:60] or "workspace"
 
-ZERO_KPIS = [
-    {"label": "Avg understanding", "value": "0", "hint": "no sessions yet"},
-    {"label": "Active learners", "value": "1", "hint": "just you"},
-    {"label": "Completion", "value": "0%", "hint": "no documents yet"},
-    {"label": "At risk", "value": "0", "hint": "all clear"},
-    {"label": "Sessions today", "value": "0", "hint": "none yet"},
-]
-
 
 def first_name(name: Optional[str]) -> str:
     return (name or "there").strip().split(" ")[0] or "there"
@@ -46,6 +47,9 @@ def _display_name(email: Optional[str]) -> str:
         if derived:
             return derived
     return "New user"
+
+
+# ---- membership --------------------------------------------------------------
 
 
 def _ensure_membership(
@@ -80,15 +84,14 @@ def _ensure_membership(
             name=name or "New user",
             email=email or f"{sub}@clerk.local",
             role=role,
-            cohort="—",
-            documents=0,
-            understanding=0,
         )
     )
     return True
 
 
-def apply_pending_invites(db: Session, sub: str, email: Optional[str], name: Optional[str] = None) -> bool:
+def apply_pending_invites(
+    db: Session, sub: str, email: Optional[str], name: Optional[str] = None
+) -> bool:
     """Join this person to every workspace that has a pending invite for their email,
     marking those invites accepted. Runs on every bootstrap (not one-shot), so an
     ALREADY-registered user gains the new membership instead of the invite being
@@ -112,11 +115,9 @@ def apply_pending_invites(db: Session, sub: str, email: Optional[str], name: Opt
 
 
 def reconcile_memberships(db: Session) -> int:
-    """One-time/idempotent backfill across ALL existing data: for every pending
-    invite whose email belongs to an already-signed-up person (a user row with a
-    clerk_id), create the missing membership and mark the invite accepted. This
-    "moves" existing data into the multi-membership model and stops people who have
-    accepted from showing as a pending invite. Returns the number of invites resolved."""
+    """Idempotent backfill: for every pending invite whose email belongs to an
+    already-signed-up person, create the missing membership and mark the invite
+    accepted. Returns the number of invites resolved."""
     invites = db.scalars(select(models.Invite).where(models.Invite.status == "pending")).all()
     resolved = 0
     for inv in invites:
@@ -150,27 +151,23 @@ def resolve_active_membership(
 ) -> models.User:
     """Resolve the signed-in person's ACTIVE workspace membership.
 
-    1. Apply any pending invites matching their email (creating memberships) so an
-       invited workspace shows up without re-signup.
-    2. Ensure at least one membership — first-ever login with no invite gets a fresh
-       personal workspace as its Admin.
-    3. Return the membership for ``active_ws_id`` when the person belongs to it, else
-       their default (earliest) membership. A stale/forged id can never select a
-       workspace they aren't a member of.
+    1. Apply any pending invites matching their email (creating memberships).
+    2. Ensure at least one membership — first-ever login with no invite gets a
+       fresh personal workspace as its Admin.
+    3. Return the membership for ``active_ws_id`` when the person belongs to it,
+       else their default (earliest) membership. A stale/forged id can never
+       select a workspace they aren't a member of.
     """
+
     def _memberships() -> list[models.User]:
         return list(
             db.scalars(
-                select(models.User)
-                .where(models.User.clerk_id == sub)
-                .order_by(models.User.id)
+                select(models.User).where(models.User.clerk_id == sub).order_by(models.User.id)
             ).all()
         )
 
     memberships = _memberships()
     eff_email = email or (memberships[0].email if memberships else None)
-    # Real name if given, else the existing one, else a sensible name from the email
-    # (never "New user"/"there").
     eff_name = name or (memberships[0].name if memberships else None) or _display_name(eff_email)
 
     if apply_pending_invites(db, sub, eff_email, eff_name):
@@ -178,10 +175,8 @@ def resolve_active_membership(
 
     if not memberships:
         if not eff_email:
-            # No membership and no email yet (Clerk hasn't populated it) — refuse to
-            # fabricate a personal workspace. Doing so would strand an INVITED user on
-            # the create-workspace/onboarding screen (their invite is matched by email).
-            # The client retries once the email is available.
+            # Refuse to fabricate a personal workspace before Clerk has an email —
+            # that would strand an INVITED user (their invite matches by email).
             raise ValueError("account not ready: email required")
         ws = models.Workspace(name=f"{first_name(eff_name)}'s workspace", plan="Personal workspace")
         db.add(ws)
@@ -192,9 +187,6 @@ def resolve_active_membership(
             name=eff_name or "New user",
             email=eff_email or f"{sub}@clerk.local",
             role="Admin",
-            cohort="—",
-            documents=0,
-            understanding=0,
         )
         db.add(user)
         db.commit()
@@ -228,8 +220,18 @@ def is_admin(user: models.User) -> bool:
     return user.role in ("Admin", "Owner")
 
 
+def is_owner(db: Session, user: models.User) -> bool:
+    """The owner is the earliest member of the workspace (its creator)."""
+    first_id = db.scalar(
+        select(func.min(models.User.id)).where(models.User.workspace_id == user.workspace_id)
+    )
+    return user.id == first_id
+
+
+# ---- lookups -----------------------------------------------------------------
+
+
 def _user_team_map(db: Session, ws_id: int) -> dict[int, str]:
-    """Map each user to their (first) team name in the workspace."""
     rows = db.execute(
         select(models.TeamMember.user_id, models.Team.name)
         .join(models.Team, models.Team.id == models.TeamMember.team_id)
@@ -242,26 +244,83 @@ def _user_team_map(db: Session, ws_id: int) -> dict[int, str]:
     return out
 
 
+def _user_cohort_map(db: Session, ws_id: int) -> dict[int, str]:
+    """Cohort label per learner, derived from membership. This used to be a
+    ``users.cohort`` string kept in sync by hand on every cohort edit."""
+    rows = db.execute(
+        select(models.CohortMember.user_id, models.Cohort.name)
+        .join(models.Cohort, models.Cohort.id == models.CohortMember.cohort_id)
+        .where(models.Cohort.workspace_id == ws_id)
+        .order_by(models.Cohort.id)
+    ).all()
+    out: dict[int, str] = {}
+    for uid, name in rows:
+        out.setdefault(uid, name)
+    return out
+
+
+def _assigned_count(db: Session, document_id: int) -> int:
+    return int(
+        db.scalar(
+            select(func.count())
+            .select_from(models.LearningPathItem)
+            .where(models.LearningPathItem.document_id == document_id)
+        )
+        or 0
+    )
+
+
+def document_out(db: Session, d: models.Document) -> dict:
+    sections = int(
+        db.scalar(
+            select(func.count()).select_from(models.Module).where(models.Module.document_id == d.id)
+        )
+        or 0
+    )
+    return {
+        "id": d.id,
+        "name": d.name,
+        "title": clean_name(d.name),
+        # `sections` is the number of TEACHING sections; `chunks` is the retrieval
+        # split. The old API returned the chunk count under the name "sections".
+        "sections": sections,
+        "chunks": d.chunk_count,
+        "assigned": _assigned_count(db, d.id),
+        "status": d.status,
+    }
+
+
+def _documents(db: Session, ws_id: int) -> list[dict]:
+    docs = db.scalars(
+        select(models.Document)
+        .where(models.Document.workspace_id == ws_id)
+        .order_by(models.Document.id.desc())
+    ).all()
+    return [document_out(db, d) for d in docs]
+
+
 def _people(db: Session, ws_id: int) -> list[dict]:
     users = db.scalars(
         select(models.User).where(models.User.workspace_id == ws_id).order_by(models.User.id)
     ).all()
     team_of = _user_team_map(db, ws_id)
+    cohort_of = _user_cohort_map(db, ws_id)
     out: list[dict] = []
     for u in users:
-        score = _user_understanding(db, u.id)
+        score = scoring.user_understanding(db, u.id)
         out.append(
             {
+                "id": u.id,
                 "name": u.name,
                 "email": u.email,
-                "cohort": u.cohort,
-                "team": team_of.get(u.id, ""),
-                "documents": u.documents,
-                # Recency-weighted (EMA) over the learner's attempts, not the last score.
-                "understanding": score or 0,
-                "band": understanding_band(score),
                 "role": u.role,
-                "id": u.id,
+                "cohort": cohort_of.get(u.id, "—"),
+                "team": team_of.get(u.id, ""),
+                "documents": len(scoring.started_document_ids(db, u.id)),
+                # Demonstrated across every document they have started — not the
+                # score of whichever section happened to be graded most recently.
+                "understanding": score,
+                "band": scoring.band(score),
             }
         )
     return out
@@ -276,34 +335,27 @@ def _pending(db: Session, ws_id: int) -> list[dict]:
     return [{"id": i.id, "email": i.email, "role": i.role} for i in invites]
 
 
+# ---- cohorts / teams ---------------------------------------------------------
+
+
 def _cohort_member_ids(db: Session, cohort_id: int) -> list[int]:
-    return list(
-        db.scalars(
-            select(models.CohortMember.user_id).where(models.CohortMember.cohort_id == cohort_id)
-        ).all()
-    )
+    return scoring.cohort_member_ids(db, cohort_id)
 
 
 def _cohort_doc_ids(db: Session, cohort_id: int) -> list[int]:
-    return list(
-        db.scalars(
-            select(models.CohortDocument.document_id)
-            .where(models.CohortDocument.cohort_id == cohort_id)
-            .order_by(models.CohortDocument.idx)
-        ).all()
-    )
+    return scoring.cohort_document_ids(db, cohort_id)
 
 
 def cohort_detail(db: Session, c: models.Cohort) -> dict:
-    """Full cohort shape for the admin UI (members + ordered documents + status)."""
     member_ids = _cohort_member_ids(db, c.id)
     doc_ids = _cohort_doc_ids(db, c.id)
     docs = [
-        {"id": d.id, "name": d.name}
+        {"id": d.id, "name": d.name, "title": clean_name(d.name)}
         for d in (db.get(models.Document, did) for did in doc_ids)
         if d is not None
     ]
-    cu = _cohort_understanding(db, c.id)
+    cu = scoring.cohort_understanding(db, c.id)
+    completion = scoring.cohort_completion(db, c.id)
     return {
         "id": c.id,
         "name": c.name,
@@ -311,14 +363,25 @@ def cohort_detail(db: Session, c: models.Cohort) -> dict:
         "memberIds": member_ids,
         "documentIds": doc_ids,
         "documents": docs,
-        "status": c.status,
         "published": c.published,
-        # Cohort-scoped, recency-weighted understanding (was the stale stored c.avg).
-        "avg": cu or 0,
-        "understanding": cu or 0,
-        "band": understanding_band(cu),
-        "completion": c.completion,
+        "understanding": cu,
+        "avg": cu or 0,  # legacy key the admin UI still reads
+        "band": scoring.band(cu),
+        "completion": completion,
+        "status": _cohort_status(cu, completion, c.published),
     }
+
+
+def _cohort_status(understanding: Optional[int], completion: int, published: bool) -> str:
+    if not published:
+        return "Draft"
+    if understanding is None:
+        return "Not started"
+    if understanding < settings.AT_RISK_THRESHOLD:
+        return "At risk"
+    if completion < 50:
+        return "Behind"
+    return "On track"
 
 
 def _cohorts(db: Session, ws_id: int) -> list[dict]:
@@ -329,29 +392,34 @@ def _cohorts(db: Session, ws_id: int) -> list[dict]:
 
 
 def _team_member_ids(db: Session, team_id: int) -> list[int]:
-    return list(
-        db.scalars(select(models.TeamMember.user_id).where(models.TeamMember.team_id == team_id)).all()
-    )
+    return [
+        int(u)
+        for u in db.scalars(
+            select(models.TeamMember.user_id).where(models.TeamMember.team_id == team_id)
+        ).all()
+    ]
 
 
 def _team_doc_ids(db: Session, team_id: int) -> list[int]:
-    return list(
-        db.scalars(
+    return [
+        int(d)
+        for d in db.scalars(
             select(models.TeamDocument.document_id)
             .where(models.TeamDocument.team_id == team_id)
             .order_by(models.TeamDocument.idx)
         ).all()
-    )
+    ]
 
 
 def team_detail(db: Session, t: models.Team) -> dict:
     member_ids = _team_member_ids(db, t.id)
     doc_ids = _team_doc_ids(db, t.id)
     docs = [
-        {"id": d.id, "name": d.name}
+        {"id": d.id, "name": d.name, "title": clean_name(d.name)}
         for d in (db.get(models.Document, did) for did in doc_ids)
         if d is not None
     ]
+    tu = scoring.team_understanding(db, t.id)
     return {
         "id": t.id,
         "name": t.name,
@@ -361,7 +429,9 @@ def team_detail(db: Session, t: models.Team) -> dict:
         "documentIds": doc_ids,
         "documents": docs,
         "published": t.published,
-        "avg": t.avg,
+        "understanding": tu,
+        "avg": tu or 0,
+        "band": scoring.band(tu),
         "paths": len(doc_ids),
     }
 
@@ -373,25 +443,7 @@ def _teams(db: Session, ws_id: int) -> list[dict]:
     return [team_detail(db, t) for t in rows]
 
 
-def _documents(db: Session, ws_id: int) -> list[dict]:
-    docs = db.scalars(
-        select(models.Document).where(models.Document.workspace_id == ws_id).order_by(models.Document.id.desc())
-    ).all()
-    return [
-        {"id": d.id, "name": d.name, "sections": d.sections, "assigned": d.assigned, "status": d.status}
-        for d in docs
-    ]
-
-
-def is_owner(db: Session, user: models.User) -> bool:
-    """The owner is the earliest member of the workspace (its creator)."""
-    first_id = db.scalar(
-        select(func.min(models.User.id)).where(models.User.workspace_id == user.workspace_id)
-    )
-    return user.id == first_id
-
-
-# ---- Learner-side data (real assignments + progress, not mock) ----
+# ---- learner-side ------------------------------------------------------------
 
 
 def _path_items(db: Session, user_id: int) -> list[models.LearningPathItem]:
@@ -404,25 +456,30 @@ def _path_items(db: Session, user_id: int) -> list[models.LearningPathItem]:
     )
 
 
-def _doc_by_name(db: Session, ws_id: int, name: str) -> Optional[models.Document]:
-    return db.scalar(
-        select(models.Document).where(
-            models.Document.workspace_id == ws_id, models.Document.name == name
+def _section_count(db: Session, document_id: int) -> int:
+    return int(
+        db.scalar(
+            select(func.count())
+            .select_from(models.Module)
+            .where(models.Module.document_id == document_id)
         )
+        or 0
     )
 
 
 def _learning_path(db: Session, user: models.User) -> list[dict]:
     out: list[dict] = []
     for i in _path_items(db, user.id):
-        doc = _doc_by_name(db, user.workspace_id, i.title)
+        doc = db.get(models.Document, i.document_id)
         out.append(
             {
-                "title": clean_name(i.title),
-                "sections": i.sections,
+                "docId": i.document_id,
+                "title": clean_name(doc.name) if doc else "",
+                "sections": _section_count(db, i.document_id),
                 "status": i.status,
-                "progress": i.progress,
-                "docId": doc.id if doc else None,
+                # % of the document taken to mastery, and how much is demonstrated.
+                "progress": scoring.document_completion(db, user.id, i.document_id),
+                "understanding": scoring.document_understanding(db, user.id, i.document_id),
             }
         )
     return out
@@ -431,32 +488,53 @@ def _learning_path(db: Session, user: models.User) -> list[dict]:
 def _my_documents(db: Session, user: models.User) -> list[dict]:
     out: list[dict] = []
     for i in _path_items(db, user.id):
-        doc = _doc_by_name(db, user.workspace_id, i.title)
-        status = (
-            "Mastered" if i.status == "mastered" else "Locked" if i.status == "locked" else "Assigned"
-        )
+        doc = db.get(models.Document, i.document_id)
+        if doc is None:
+            continue
         out.append(
             {
-                "name": clean_name(i.title),
-                "pages": doc.sections if doc else i.sections,
-                "status": status,
+                "docId": doc.id,
+                "name": clean_name(doc.name),
+                "pages": doc.chunk_count,
+                "sections": _section_count(db, doc.id),
+                "status": (
+                    "Mastered"
+                    if i.status == "mastered"
+                    else "Locked"
+                    if i.status == "locked"
+                    else "Assigned"
+                ),
                 "added": "",
-                "docId": doc.id if doc else None,
             }
         )
     return out
 
 
-def _past_sessions(db: Session, user: models.User) -> list[dict]:
+def _past_sessions(db: Session, user: models.User, limit: int = 10) -> list[dict]:
     rows = db.scalars(
         select(models.LearningSession)
         .where(models.LearningSession.user_id == user.id)
         .order_by(models.LearningSession.id.desc())
+        .limit(limit)
     ).all()
-    return [
-        {"doc": clean_name(s.doc), "date": s.date, "score": s.score, "duration": s.duration, "topics": s.topics}
-        for s in rows[:10]
-    ]
+    out: list[dict] = []
+    for s in rows:
+        doc = db.get(models.Document, s.document_id)
+        out.append(
+            {
+                "id": s.id,
+                "doc": clean_name(doc.name) if doc else "",
+                "docId": s.document_id,
+                "section": s.module_idx + 1,
+                "date": s.started_at.date().isoformat() if s.started_at else "",
+                "score": s.score,  # null = the sitting had nothing to assess
+                "band": scoring.band(s.score),
+                "summary": s.summary,
+                "turns": s.learner_turns,
+                "topics": s.topics,
+            }
+        )
+    return out
 
 
 def _continue_learning(db: Session, user: models.User) -> Optional[dict]:
@@ -470,35 +548,19 @@ def _continue_learning(db: Session, user: models.User) -> Optional[dict]:
     )
     if item is None:
         return None
-    doc = _doc_by_name(db, user.workspace_id, item.title)
-    total = item.sections
-    cur = 1
-    doc_score = user.understanding  # comprehension score for this doc (latest), fallback
-    if doc is not None:
-        total = (
-            db.scalar(
-                select(func.count()).select_from(models.Module).where(models.Module.document_id == doc.id)
-            )
-            or item.sections
-        )
-        prog = db.scalar(
-            select(models.SectionProgress).where(
-                models.SectionProgress.user_id == user.id,
-                models.SectionProgress.document_id == doc.id,
-            )
-        )
-        cur = (prog.module_idx + 1) if prog else 1
-        if prog is not None and prog.score is not None:
-            doc_score = prog.score
-    started = (item.progress or 0) > 0
+    doc = db.get(models.Document, item.document_id)
+    if doc is None:
+        return None
+    total = _section_count(db, doc.id)
+    cur = scoring.next_section_idx(db, user.id, doc.id, total) + 1
+    completion = scoring.document_completion(db, user.id, doc.id)
     return {
-        "doc": clean_name(item.title),
+        "docId": doc.id,
+        "doc": clean_name(doc.name),
         "position": f"Section {min(cur, total)} of {total}" if total else "Ready to start",
-        "remaining": "Pick up where you left off." if started else "Start your first section.",
-        # understanding = comprehension SCORE (not section %); progress = % of sections done.
-        "understanding": doc_score,
-        "progress": item.progress if item.progress is not None else 0,
-        "docId": doc.id if doc else None,
+        "remaining": "Pick up where you left off." if completion else "Start your first section.",
+        "understanding": scoring.document_understanding(db, user.id, doc.id),
+        "progress": completion,
     }
 
 
@@ -516,135 +578,69 @@ def _learner_stats(db: Session, user: models.User) -> dict:
     return {"pathProgress": f"{mastered} / {len(items)}", "sessions": int(sessions)}
 
 
-def _understanding_trend(db: Session, ws_id: int) -> list[dict]:
-    """Workspace understanding over time: one point per session (last 12),
-    oldest → newest, for the admin trend chart. Empty until sessions exist."""
-    rows = db.execute(
-        select(models.LearningSession.date, models.LearningSession.score)
-        .join(models.User, models.User.id == models.LearningSession.user_id)
-        .where(models.User.workspace_id == ws_id)
-        .order_by(models.LearningSession.id)
-    ).all()
-    rows = rows[-12:]
-    out: list[dict] = []
-    for idx, (d, s) in enumerate(rows):
-        # Label alternate points to keep the x-axis readable (ISO date → MM-DD).
-        label = (d or "")[5:] if idx % 2 == 0 else ""
-        out.append({"m": label, "v": int(s or 0)})
-    return out
+# ---- admin analytics ---------------------------------------------------------
 
 
 def _understanding_series(db: Session, ws_id: int) -> list[dict]:
-    """Raw workspace session points (ISO date + score), oldest → newest, so the
-    Overview chart can re-bucket by week / month / quarter."""
+    """Raw scored sittings (ISO date + score), oldest → newest, so the Overview
+    chart can re-bucket by week / month / quarter. Unscoreable sittings are
+    excluded — plotting them as zeros is what made the trend look like noise."""
     rows = db.execute(
-        select(models.LearningSession.date, models.LearningSession.score)
+        select(models.LearningSession.started_at, models.LearningSession.score)
         .join(models.User, models.User.id == models.LearningSession.user_id)
-        .where(models.User.workspace_id == ws_id)
+        .where(models.User.workspace_id == ws_id, models.LearningSession.score.is_not(None))
         .order_by(models.LearningSession.id)
     ).all()
-    return [{"date": d or "", "score": int(s or 0)} for d, s in rows]
+    return [{"date": d.date().isoformat() if d else "", "score": int(s)} for d, s in rows]
 
 
-# ---- Cohort-scoped, recency-weighted understanding (EMA) ----------------------
-# Each session writes a 0-100 LearningSession score for a section. We aggregate those
-# with an exponential moving average (recent attempts weighted more) so re-learning
-# raises the number quickly while a single noisy score doesn't whipsaw it, then scope
-# the average to a cohort's documents. See the scoring rationale discussion.
-
-_EMA_ALPHA = 0.5  # weight on the latest attempt; older attempts decay
-
-
-def understanding_band(score: Optional[int]) -> str:
-    """Proficiency band for an understanding score (corporate-competency style)."""
-    if score is None:
-        return "Not started"
-    if score >= 90:
-        return "Mastered"
-    if score >= 70:
-        return "Proficient"
-    if score >= 40:
-        return "Progressing"
-    return "Developing"
+def _understanding_trend(db: Session, ws_id: int) -> list[dict]:
+    series = _understanding_series(db, ws_id)[-12:]
+    return [
+        {"m": (p["date"] or "")[5:] if i % 2 == 0 else "", "v": p["score"]}
+        for i, p in enumerate(series)
+    ]
 
 
-def _doc_ema(db: Session, user_id: int, doc_name: str) -> Optional[int]:
-    """Recency-weighted (EMA) understanding for one learner on one document, replayed
-    from their session-score history (recent attempts weighted more). Ignores 0s
-    (no-answer/failed runs). None when there is no scored attempt."""
-    scores = db.scalars(
-        select(models.LearningSession.score)
-        .where(models.LearningSession.user_id == user_id, models.LearningSession.doc == doc_name)
-        .order_by(models.LearningSession.id)
-    ).all()
-    ema: Optional[float] = None
-    for s in scores:
-        if not s or s <= 0:
-            continue
-        ema = float(s) if ema is None else _EMA_ALPHA * s + (1 - _EMA_ALPHA) * ema
-    return round(ema) if ema is not None else None
+def _workspace_learners(db: Session, ws_id: int) -> list[models.User]:
+    return list(db.scalars(select(models.User).where(models.User.workspace_id == ws_id)).all())
 
 
-def _cohort_doc_names(db: Session, cohort_id: int) -> list[str]:
-    docs = (db.get(models.Document, did) for did in _cohort_doc_ids(db, cohort_id))
-    return [d.name for d in docs if d is not None]
-
-
-def _scoped_understanding(db: Session, user_id: int, doc_names: list[str]) -> Optional[int]:
-    """A learner's understanding scoped to a set of documents (e.g. a cohort's docs):
-    the average of their per-document EMA over the docs they have actually attempted."""
-    emas = [e for e in (_doc_ema(db, user_id, n) for n in doc_names) if e is not None]
-    return round(sum(emas) / len(emas)) if emas else None
-
-
-def _user_understanding(db: Session, user_id: int) -> Optional[int]:
-    """Overall recency-weighted understanding across every document the learner has
-    attempted (workspace People table)."""
-    names = list(
+def _kpis(db: Session, ws_id: int) -> list[dict]:
+    users = _workspace_learners(db, ws_id)
+    measured = [v for v in (scoring.user_understanding(db, u.id) for u in users) if v is not None]
+    avg = round(sum(measured) / len(measured)) if measured else 0
+    at_risk = sum(1 for v in measured if v < settings.AT_RISK_THRESHOLD)
+    items = (
         db.scalars(
-            select(models.LearningSession.doc)
-            .where(models.LearningSession.user_id == user_id)
-            .distinct()
+            select(models.LearningPathItem).where(
+                models.LearningPathItem.user_id.in_([u.id for u in users])
+            )
         ).all()
+        if users
+        else []
     )
-    return _scoped_understanding(db, user_id, names)
-
-
-def _cohort_understanding(db: Session, cohort_id: int) -> Optional[int]:
-    """Average cohort-scoped understanding across the cohort's members (EMA over the
-    cohort's documents only)."""
-    doc_names = _cohort_doc_names(db, cohort_id)
-    if not doc_names:
-        return None
-    vals = [
-        v
-        for v in (_scoped_understanding(db, uid, doc_names) for uid in _cohort_member_ids(db, cohort_id))
-        if v is not None
+    mastered = sum(1 for i in items if i.status == "mastered")
+    completion = round(100 * mastered / len(items)) if items else 0
+    return [
+        {"label": "Avg understanding", "value": str(avg), "hint": "demonstrated, not guessed"},
+        {"label": "Active learners", "value": str(len(measured)), "hint": f"of {len(users)} in workspace"},
+        {"label": "Completion", "value": f"{completion}%", "hint": "documents mastered"},
+        {"label": "At risk", "value": str(at_risk), "hint": f"below {settings.AT_RISK_THRESHOLD}"},
+        {"label": "Sessions today", "value": str(scoring.sessions_today(db, ws_id)), "hint": ""},
     ]
-    return round(sum(vals) / len(vals)) if vals else None
-
-
-def _avg_understanding(db: Session, user_ids: list[int]) -> int:
-    """Average understanding over the MEASURED members of a group (those with a
-    score > 0). 0 when nobody in the group has been measured yet."""
-    if not user_ids:
-        return 0
-    scores = [
-        u.understanding
-        for u in db.scalars(select(models.User).where(models.User.id.in_(user_ids))).all()
-        if u.understanding and u.understanding > 0
-    ]
-    return round(sum(scores) / len(scores)) if scores else 0
 
 
 def _understanding_kpis(db: Session, ws_id: int) -> list[dict]:
-    """Real, workspace-scoped headline numbers for the Understanding page."""
-    users = list(db.scalars(select(models.User).where(models.User.workspace_id == ws_id)).all())
-    per_user = [_user_understanding(db, u.id) for u in users]  # recency-weighted (EMA)
-    measured = [v for v in per_user if v is not None]
+    users = _workspace_learners(db, ws_id)
+    measured = [v for v in (scoring.user_understanding(db, u.id) for u in users) if v is not None]
     avg = round(sum(measured) / len(measured)) if measured else 0
     docs = (
-        db.scalar(select(func.count()).select_from(models.Document).where(models.Document.workspace_id == ws_id))
+        db.scalar(
+            select(func.count())
+            .select_from(models.Document)
+            .where(models.Document.workspace_id == ws_id)
+        )
         or 0
     )
     topics = (
@@ -656,22 +652,25 @@ def _understanding_kpis(db: Session, ws_id: int) -> list[dict]:
         )
         or 0
     )
-    user_ids = [u.id for u in users]
-    total = mastered = 0
-    if user_ids:
-        items = list(
-            db.scalars(
-                select(models.LearningPathItem).where(models.LearningPathItem.user_id.in_(user_ids))
-            ).all()
-        )
-        total = len(items)
-        mastered = sum(1 for i in items if i.status == "mastered")
-    mastery = round(100 * mastered / total) if total else 0
+    items = (
+        db.scalars(
+            select(models.LearningPathItem).where(
+                models.LearningPathItem.user_id.in_([u.id for u in users])
+            )
+        ).all()
+        if users
+        else []
+    )
+    mastery = round(100 * sum(1 for i in items if i.status == "mastered") / len(items)) if items else 0
     return [
         {"label": "Average understanding", "value": str(avg), "hint": "demonstrated, not guessed"},
         {"label": "Learners measured", "value": str(len(measured)), "hint": "in this workspace"},
-        {"label": "Topics tracked", "value": str(int(topics)), "hint": f"from {int(docs)} document{'' if docs == 1 else 's'}"},
-        {"label": "Mastery rate", "value": f"{mastery}%", "hint": "sections mastered"},
+        {
+            "label": "Sections tracked",
+            "value": str(int(topics)),
+            "hint": f"from {int(docs)} document{'' if docs == 1 else 's'}",
+        },
+        {"label": "Mastery rate", "value": f"{mastery}%", "hint": "documents mastered"},
     ]
 
 
@@ -680,14 +679,21 @@ def _cohort_health(db: Session, ws_id: int) -> list[dict]:
     for c in db.scalars(
         select(models.Cohort).where(models.Cohort.workspace_id == ws_id).order_by(models.Cohort.id)
     ).all():
-        cu = _cohort_understanding(db, c.id)  # cohort-scoped, recency-weighted
-        out.append({"name": c.name, "value": cu or 0, "band": understanding_band(cu), "pct": c.completion})
+        cu = scoring.cohort_understanding(db, c.id)
+        out.append(
+            {
+                "name": c.name,
+                "value": cu or 0,
+                "band": scoring.band(cu),
+                "pct": scoring.cohort_completion(db, c.id),
+            }
+        )
     return out
 
 
 def _team_health(db: Session, ws_id: int) -> list[dict]:
     return [
-        {"name": t.name, "value": _avg_understanding(db, _team_member_ids(db, t.id))}
+        {"name": t.name, "value": scoring.team_understanding(db, t.id) or 0}
         for t in db.scalars(
             select(models.Team).where(models.Team.workspace_id == ws_id).order_by(models.Team.id)
         ).all()
@@ -695,25 +701,23 @@ def _team_health(db: Session, ws_id: int) -> list[dict]:
 
 
 def _falling_behind(db: Session, ws_id: int) -> list[dict]:
-    users = db.scalars(select(models.User).where(models.User.workspace_id == ws_id)).all()
+    cohort_of = _user_cohort_map(db, ws_id)
     out: list[dict] = []
-    for u in users:
-        score = _user_understanding(db, u.id)  # recency-weighted (EMA)
-        if score is not None and 0 < score < 55:
+    for u in _workspace_learners(db, ws_id):
+        score = scoring.user_understanding(db, u.id)
+        if score is not None and score < settings.AT_RISK_THRESHOLD:
             out.append(
                 {
                     "name": u.name,
-                    "cohort": u.cohort if u.cohort and u.cohort != "—" else "No cohort",
+                    "cohort": cohort_of.get(u.id, "No cohort"),
                     "score": score,
+                    "band": scoring.band(score),
                 }
             )
     return sorted(out, key=lambda x: x["score"])[:8]
 
 
 def _user_workspaces(db: Session, user: models.User) -> list[dict]:
-    """Every workspace this person belongs to (drives the switcher), with their role
-    in each. Falls back to just the active membership when there's no clerk_id
-    (auth-disabled dev mode)."""
     if not user.clerk_id:
         rows = [user]
     else:
@@ -737,18 +741,24 @@ def build_bundle(db: Session, user: models.User, display_name: str) -> dict:
     ws = db.get(models.Workspace, user.workspace_id)
     needs_onboarding = (not ws.onboarded) and is_owner(db, user)
     stats = _learner_stats(db, user)
+    understanding = scoring.user_understanding(db, user.id)
     return {
         "mode": "user",
         "needsOnboarding": needs_onboarding,
         "workspace": {"name": ws.name, "plan": ws.plan, "slug": ws.slug or slugify(ws.name)},
-        "account": {"name": display_name, "email": user.email, "role": "Workspace owner" if is_admin(user) else user.role},
+        "account": {
+            "name": display_name,
+            "email": user.email,
+            "role": "Workspace owner" if is_admin(user) else user.role,
+        },
         "role": user.role,
         "workspaces": _user_workspaces(db, user),
         "activeWorkspaceId": user.workspace_id,
         "learner": {
             "name": display_name,
             "firstName": first_name(display_name),
-            "understanding": user.understanding,
+            "understanding": understanding,
+            "band": scoring.band(understanding),
             "pathProgress": stats["pathProgress"],
             "practisedThisWeek": "0m",
             "sessions": stats["sessions"],
@@ -759,7 +769,7 @@ def build_bundle(db: Session, user: models.User, display_name: str) -> dict:
         "pastSessions": _past_sessions(db, user),
         "myDocuments": _my_documents(db, user),
         "admin": {
-            "kpis": ZERO_KPIS,
+            "kpis": _kpis(db, user.workspace_id),
             "understandingKpis": _understanding_kpis(db, user.workspace_id),
             "understandingTrend": _understanding_trend(db, user.workspace_id),
             "understandingSeries": _understanding_series(db, user.workspace_id),

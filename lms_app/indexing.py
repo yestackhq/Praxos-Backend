@@ -61,17 +61,22 @@ def chunk_text(text: str) -> list[str]:
 
 
 def index_document(db: Session, doc: models.Document, data: bytes) -> int:
-    """Extract → chunk → embed → store. Sets the document status and section
-    count. Returns the number of chunks indexed. Replaces any prior chunks."""
+    """Extract -> chunk -> embed -> store. Sets the document status and chunk
+    count. Returns the number of chunks indexed. Replaces any prior chunks.
+
+    Any existing teaching plan is dropped: its chunk ranges point into the OLD
+    chunk list, so keeping it would leave sections grounded in the wrong text."""
     for old in list(doc.chunks):
         db.delete(old)
+    for old_module in list(doc.modules):
+        db.delete(old_module)
     db.flush()
 
     text = extract_text(data)
     chunks = chunk_text(text)
     if not chunks:
         doc.status = "Needs review"  # couldn't read the file (scanned/encrypted)
-        doc.sections = 0
+        doc.chunk_count = 0
         db.commit()
         return 0
 
@@ -85,7 +90,7 @@ def index_document(db: Session, doc: models.Document, data: bytes) -> int:
                 embedding=vectors[i] if vectors else None,
             )
         )
-    doc.sections = len(chunks)
+    doc.chunk_count = len(chunks)
     doc.status = "Indexed"
     db.commit()
     return len(chunks)

@@ -1,58 +1,94 @@
 from __future__ import annotations
 
-"""HyperMem (helix) conversation-memory client.
+"""Conversation memory, backed by mem0 (``mem0ai``).
 
-The voice tutor uses this to remember a learner across sessions and chapters of
-a document:
+The voice tutor uses this to remember a learner across sessions and sections:
 
-  • at session END  → ``write_session`` ingests the transcript (+ a distilled
-                       summary) so the learner's name, context, strengths and
-                       gaps become queryable facts.
-  • at session START → ``recap_for_tutor`` retrieves what the learner already
-                       knows / struggled with and returns a short block that is
-                       injected into the tutor's instructions, so the agent
-                       greets them by name and continues confidently.
+  • at session END   → ``write_session`` ingests the turns (+ the distilled
+                        assessment) so what the learner grasped and missed
+                        becomes a queryable fact.
+  • at session START → ``recap_for_tutor`` retrieves those facts and returns a
+                        short block injected into the tutor's instructions.
+  • before scoring   → ``prior_understanding`` pulls what this learner has
+                        already demonstrated, so the grader can tell a genuinely
+                        new explanation from a repeat of a memorised phrase.
 
-Scope mapping (so reads and writes line up):
-  tenant_id  = "<HELIX_TENANT>-ws<workspace_id>"   (isolate each workspace)
-  namespace  = "doc-<document_id>"                  (one bucket per document)
-  user_id    = "user-<user_id>"                     (the learner)
-  conversation_id = a per-session id (one episode per chapter/session)
+Entity partitioning
+-------------------
+Following mem0's entity-partitioning playbook, every write and every read is
+tagged so one learner's memories can never leak into another's, and one
+document's context can never bleed into another's:
 
-Everything degrades gracefully: when HELIX is unconfigured or unreachable the
-functions return ``False`` / ``""`` / ``None`` and the caller carries on without
-memory. Nothing here ever raises into a request handler.
+  user_id  = "ws<workspace>-user<user>"   the learner, inside their workspace
+  run_id   = "doc<document>-s<session>"   one episode (one section sitting)
+  agent_id = "praxos-tutor"               the role writing the memory
+  metadata = {workspace_id, document_id, module_idx, kind}
+
+Retrieval uses AND filters over ``user_id`` + ``metadata.document_id`` for
+cross-session recall of one document, and adds ``run_id`` to re-open a single
+paused sitting. NOTE: ``agent_id`` is sent for forward-compatibility but is NOT
+relied on for retrieval — it is not persisted on every mem0 plan, so filtering
+on it can silently return nothing. The playbook's "use wildcards / avoid field
+mismatches" warning is exactly this failure mode.
+
+Everything degrades gracefully: with no ``MEM0_API_KEY`` the functions return
+False / "" / None and the tutor simply teaches without recall. Nothing here ever
+raises into a request handler.
 """
 
 import logging
+from functools import lru_cache
 from typing import Optional
-
-import httpx
 
 from .config import settings
 
 logger = logging.getLogger("praxos.memory")
 
+AGENT_ID = "praxos-tutor"
 
-def _headers() -> dict:
+
+@lru_cache
+def _client():
+    if not settings.memory_enabled:
+        return None
+    try:
+        from mem0 import MemoryClient
+
+        return MemoryClient(api_key=settings.MEM0_API_KEY)
+    except Exception as exc:  # missing package / bad key — degrade, never break
+        logger.warning("mem0 client unavailable: %s", exc)
+        return None
+
+
+def _learner(workspace_id: int, user_id: int) -> str:
+    return f"ws{workspace_id}-user{user_id}"
+
+
+def _episode(document_id: int, session_id: int | str) -> str:
+    return f"doc{document_id}-s{session_id}"
+
+
+def _doc_filter(workspace_id: int, user_id: int, document_id: int) -> dict:
     return {
-        "Authorization": f"Bearer {settings.HELIX_API_KEY}",
-        "Content-Type": "application/json",
+        "AND": [
+            {"user_id": _learner(workspace_id, user_id)},
+            {"metadata": {"document_id": document_id}},
+        ]
     }
 
 
-def _scope(workspace_id: int, user_id: int, document_id: int) -> dict:
-    return {
-        "tenant_id": f"{settings.HELIX_TENANT}-ws{workspace_id}",
-        "namespace": f"doc-{document_id}",
-        "user_id": f"user-{user_id}",
-    }
-
-
-# HyperMem turn roles are {"user","assistant","system"}; Praxos transcripts use
-# {"learner","tutor"}. The learner is the human ("user"), the tutor is the AI.
+# mem0 roles are {"user","assistant"}; Praxos transcripts use {"learner","tutor"}.
 def _to_mem_role(role: str) -> str:
     return "user" if role == "learner" else "assistant"
+
+
+def _memories(resp) -> list[dict]:
+    if isinstance(resp, dict):
+        return list(resp.get("results") or [])
+    return list(resp or [])
+
+
+# ---- writes ------------------------------------------------------------------
 
 
 def write_session(
@@ -60,17 +96,16 @@ def write_session(
     workspace_id: int,
     user_id: int,
     document_id: int,
-    conversation_id: str,
+    session_id: int | str,
+    module_idx: int = 0,
     transcript: list[dict],
     summary: Optional[str] = None,
-    sync: bool = False,
 ) -> bool:
-    """Ingest a finished session's transcript into memory. ``transcript`` is a
-    list of {role: "learner"|"tutor", text: str}. An optional ``summary`` (the
-    distilled understanding/strengths/gaps) is appended as a final note so it's
-    captured as facts. Async by default (returns fast; extraction happens in the
-    background). Returns True on a 2xx, False otherwise — never raises."""
-    if not settings.helix_enabled:
+    """Ingest a finished sitting. ``transcript`` is [{role: learner|tutor, text}].
+    The optional ``summary`` (what they grasped / missed) is appended so the
+    assessment itself becomes recallable. Returns True on success."""
+    client = _client()
+    if client is None:
         return False
     turns = [
         {"role": _to_mem_role(t.get("role", "")), "content": t.get("text", "").strip()}
@@ -80,27 +115,24 @@ def write_session(
     if not turns:
         return False
     if summary and summary.strip():
-        turns.append({"role": "assistant", "content": f"[Session summary] {summary.strip()}"})
-
-    payload = {
-        **_scope(workspace_id, user_id, document_id),
-        "conversation_id": conversation_id,
-        "sync": sync,
-        "turns": turns,
-    }
+        turns.append({"role": "assistant", "content": f"[Assessment] {summary.strip()}"})
     try:
-        resp = httpx.post(
-            f"{settings.HELIX_URL}/v1/ingest",
-            headers=_headers(),
-            json=payload,
-            timeout=settings.HELIX_WRITE_TIMEOUT,
+        client.add(
+            turns,
+            user_id=_learner(workspace_id, user_id),
+            agent_id=AGENT_ID,
+            run_id=_episode(document_id, session_id),
+            metadata={
+                "workspace_id": workspace_id,
+                "document_id": document_id,
+                "module_idx": module_idx,
+                "kind": "session",
+            },
+            version="v2",
         )
-        ok = resp.status_code < 300
-        if not ok:
-            logger.warning("helix ingest failed: %s %s", resp.status_code, resp.text[:200])
-        return ok
-    except Exception as exc:  # network/timeout — degrade, never break scoring
-        logger.warning("helix ingest error: %s", exc)
+        return True
+    except Exception as exc:
+        logger.warning("mem0 add(session) failed: %s", exc)
         return False
 
 
@@ -111,13 +143,12 @@ def write_lesson_plan(
     document_id: int,
     doc_name: str,
     modules: list[dict],
-    sync: bool = False,
 ) -> bool:
-    """Seed a learner's memory for a document with the AI teaching plan, so the
-    tutor recalls WHAT to teach and HOW — section by section — from the very first
-    session. ``modules`` is a list of {idx, title, description, topics}. Returns
-    True on a 2xx, False otherwise — never raises."""
-    if not settings.helix_enabled or not modules:
+    """Seed a learner's memory with the teaching plan, so the tutor recalls WHAT
+    to teach and HOW from the very first session. ``modules`` is a list of
+    {idx, title, description, topics}."""
+    client = _client()
+    if client is None or not modules:
         return False
     lines: list[str] = []
     for m in modules:
@@ -126,31 +157,32 @@ def write_lesson_plan(
         if topics:
             line += f" Key topics: {topics}."
         lines.append(line)
-    plan_text = "\n".join(lines)
-
-    payload = {
-        **_scope(workspace_id, user_id, document_id),
-        "conversation_id": f"praxos-plan-doc{document_id}",
-        "sync": sync,
-        "turns": [
-            {"role": "user", "content": f"What will I learn from '{doc_name}' and how will you teach it?"},
-            {"role": "assistant", "content": f"[Lesson plan] Here is how I will teach '{doc_name}':\n{plan_text}"},
-        ],
-    }
     try:
-        resp = httpx.post(
-            f"{settings.HELIX_URL}/v1/ingest",
-            headers=_headers(),
-            json=payload,
-            timeout=settings.HELIX_WRITE_TIMEOUT,
+        client.add(
+            [
+                {"role": "user", "content": f"What will I learn from '{doc_name}' and how will you teach it?"},
+                {
+                    "role": "assistant",
+                    "content": f"[Lesson plan] Here is how I will teach '{doc_name}':\n" + "\n".join(lines),
+                },
+            ],
+            user_id=_learner(workspace_id, user_id),
+            agent_id=AGENT_ID,
+            run_id=f"doc{document_id}-plan",
+            metadata={
+                "workspace_id": workspace_id,
+                "document_id": document_id,
+                "kind": "lesson_plan",
+            },
+            version="v2",
         )
-        ok = resp.status_code < 300
-        if not ok:
-            logger.warning("helix plan ingest failed: %s %s", resp.status_code, resp.text[:200])
-        return ok
+        return True
     except Exception as exc:
-        logger.warning("helix plan ingest error: %s", exc)
+        logger.warning("mem0 add(plan) failed: %s", exc)
         return False
+
+
+# ---- reads -------------------------------------------------------------------
 
 
 def recall(
@@ -159,33 +191,24 @@ def recall(
     user_id: int,
     document_id: int,
     query: str,
-    top_k: int = 12,
-    answer: bool = True,
-) -> Optional[dict]:
-    """Query the learner's memory for this document. Returns the raw HyperMem
-    response ({answer, facts, ...}) or None on failure — never raises."""
-    if not settings.helix_enabled:
-        return None
-    payload = {
-        **_scope(workspace_id, user_id, document_id),
-        "query": query,
-        "fact_top_k": top_k,
-        "answer": answer,
-    }
+    top_k: int = 10,
+    session_id: Optional[int | str] = None,
+) -> list[dict]:
+    """Facts this learner has accumulated on this document. Pass ``session_id``
+    to narrow to one sitting. Returns [] on any failure — never raises."""
+    client = _client()
+    if client is None:
+        return []
+    filters = _doc_filter(workspace_id, user_id, document_id)
+    if session_id is not None:
+        filters["AND"].append({"run_id": _episode(document_id, session_id)})
     try:
-        resp = httpx.post(
-            f"{settings.HELIX_URL}/v1/retrieve",
-            headers=_headers(),
-            json=payload,
-            timeout=settings.HELIX_READ_TIMEOUT,
+        return _memories(
+            client.search(query, filters=filters, top_k=top_k, version="v2")
         )
-        if resp.status_code >= 300:
-            logger.warning("helix retrieve failed: %s %s", resp.status_code, resp.text[:200])
-            return None
-        return resp.json()
     except Exception as exc:
-        logger.warning("helix retrieve error: %s", exc)
-        return None
+        logger.warning("mem0 search failed: %s", exc)
+        return []
 
 
 def recap_for_tutor(
@@ -195,35 +218,54 @@ def recap_for_tutor(
     document_id: int,
     doc_name: str,
 ) -> str:
-    """Build a recap block for the tutor's instructions from prior memory.
-
-    Returns "" when there's no usable memory (first-ever session, or memory off/
-    slow) so the caller can teach from scratch. Otherwise returns a short block:
-    a synthesized recap line plus a few specific facts the tutor can lean on.
-    """
-    data = recall(
+    """A recap block for the tutor's instructions. "" when there is nothing to
+    recall (first session, or memory unconfigured), so the caller teaches fresh."""
+    facts = recall(
         workspace_id=workspace_id,
         user_id=user_id,
         document_id=document_id,
         query=(
-            f"Who is this learner and what have they already covered and struggled with in "
-            f"'{doc_name}'? Include their name, role/context, strengths, and gaps."
+            f"What has this learner already covered, understood and struggled with in "
+            f"'{doc_name}'? Include their role/context, strengths and gaps."
         ),
-        top_k=12,
-        answer=True,
+        top_k=settings.MEMORY_RECAP_FACTS,
     )
-    if not data:
+    lines = [str(f.get("memory") or "").strip() for f in facts]
+    lines = [ln for ln in lines if ln][: settings.MEMORY_RECAP_FACTS]
+    if not lines:
         return ""
-    answer = (data.get("answer") or "").strip()
-    facts = [f.get("content", "").strip() for f in data.get("facts", []) if f.get("content")]
-    facts = facts[:6]
-    if not answer and not facts:
-        return ""
+    return "\n".join(
+        ["--- WHAT YOU ALREADY KNOW ABOUT THIS LEARNER (earlier sessions) ---", *(f"• {ln}" for ln in lines)]
+    )
 
-    lines = ["--- WHAT YOU ALREADY KNOW ABOUT THIS LEARNER (from earlier sessions) ---"]
-    if answer:
-        lines.append(answer)
-    if facts:
-        lines.append("Specific recalled facts:")
-        lines.extend(f"• {f}" for f in facts)
-    return "\n".join(lines)
+
+def prior_understanding(
+    *, workspace_id: int, user_id: int, document_id: int, topic: str
+) -> list[str]:
+    """What this learner has previously demonstrated on a topic — given to the
+    grader so a fresh explanation is credited and a parroted one is not."""
+    facts = recall(
+        workspace_id=workspace_id,
+        user_id=user_id,
+        document_id=document_id,
+        query=f"What has this learner already demonstrated understanding of regarding {topic}?",
+        top_k=6,
+    )
+    return [str(f.get("memory") or "").strip() for f in facts if f.get("memory")]
+
+
+def forget_document(*, workspace_id: int, user_id: int, document_id: int) -> bool:
+    """Drop a learner's memories for one document — used when an admin resets a
+    document so a re-learn starts genuinely clean."""
+    client = _client()
+    if client is None:
+        return False
+    try:
+        client.delete_all(
+            user_id=_learner(workspace_id, user_id),
+            metadata={"document_id": document_id},
+        )
+        return True
+    except Exception as exc:
+        logger.warning("mem0 delete_all failed: %s", exc)
+        return False

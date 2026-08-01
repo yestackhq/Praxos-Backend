@@ -7,81 +7,24 @@ def test_health(client):
     body = r.json()
     assert body["status"] == "ok"
     assert body["auth_enabled"] is False  # no Clerk key in tests
+    # Capabilities are reported so a misconfigured deploy is visible here.
+    assert body["llm"]["enabled"] is False
+    assert body["voice_enabled"] is False
+    assert body["memory_enabled"] is False
 
 
 def test_workspace(client):
+    """No demo seed any more — an untouched deployment starts genuinely empty."""
     r = client.get("/api/workspace")
     assert r.status_code == 200
-    assert r.json()["name"] == "Meridian Health"
+    assert isinstance(r.json(), dict)
 
 
-def test_learner_home(client):
-    r = client.get("/api/learner/home")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["name"] == "Daniel Acheampong"
-    assert body["understanding"] == 74
-    assert body["path_progress"] == "1 / 5"
-    assert len(body["path"]) == 5
-    # path is ordered; first item mastered, second in progress
-    assert body["path"][0]["status"] == "mastered"
-    assert body["path"][1]["status"] == "in_progress"
-    assert body["path"][1]["progress"] == 62
 
 
-def test_learner_sessions(client):
-    r = client.get("/api/learner/sessions")
-    assert r.status_code == 200
-    rows = r.json()
-    assert len(rows) == 4
-    assert rows[0]["doc"] == "Code of conduct"
-    assert all("score" in row for row in rows)
 
 
-def test_admin_overview(client):
-    r = client.get("/api/admin/overview")
-    assert r.status_code == 200
-    body = r.json()
-    assert len(body["kpis"]) == 5
-    assert len(body["cohort_health"]) == 4
-    # at-risk learners have understanding < 55
-    assert all(p["understanding"] < 55 for p in body["people_at_risk"])
-    assert any(p["name"] == "Grace Mwangi" for p in body["people_at_risk"])
 
-
-def test_admin_people(client):
-    r = client.get("/api/admin/people")
-    assert r.status_code == 200
-    rows = r.json()
-    assert len(rows) == 8
-    roles = {row["role"] for row in rows}
-    assert {"Learner", "Manager", "Admin"} <= roles
-
-
-def test_admin_teams_and_cohorts(client):
-    teams = client.get("/api/admin/teams").json()
-    cohorts = client.get("/api/admin/cohorts").json()
-    assert len(teams) == 6
-    assert len(cohorts) == 4
-    eng = next(t for t in teams if t["name"] == "Engineering")
-    assert eng["lead"] == "Marcus Lindqvist"
-    assert eng["avg"] == 82
-
-
-def test_documents_and_plan(client):
-    docs = client.get("/api/documents").json()
-    assert len(docs) == 6
-    gdpr = next(d for d in docs if d["name"] == "Data protection & GDPR")
-    plan = client.get(f"/api/documents/{gdpr['id']}/plan").json()
-    assert plan["doc"] == "Data protection & GDPR"
-    assert len(plan["modules"]) == 5
-    assert plan["modules"][0]["title"] == "What personal data means"
-    assert "Definitions" in plan["modules"][0]["topics"]
-
-
-def test_document_plan_404(client):
-    r = client.get("/api/documents/99999/plan")
-    assert r.status_code == 404
 
 
 def test_bootstrap_requires_identity(client):
@@ -104,8 +47,9 @@ def test_bootstrap_new_user_starts_empty(client):
         assert b["learner"]["name"] == "Ada Lovelace"
         assert b["learner"]["firstName"] == "Ada"
         assert b["workspace"]["name"] == "Ada's workspace"
-        # everything empty/zeroed
-        assert b["learner"]["understanding"] == 0
+        # everything empty. understanding is None — "not measured", which is a
+        # different claim from "scored zero".
+        assert b["learner"]["understanding"] is None
         assert b["learner"]["sessions"] == 0
         assert b["continueLearning"] is None
         assert b["learningPath"] == []

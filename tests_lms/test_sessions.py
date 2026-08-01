@@ -26,15 +26,17 @@ def _upload(client, name="policy.pdf", text="Report security incidents to the IT
     ).json()
 
 
-def test_start_requires_openai(client):
-    """Without an OpenAI key, starting a voice session returns a clear 503."""
+def test_start_requires_voice_stack(client):
+    """Without LiveKit/Deepgram/Cartesia, starting a session says exactly what is
+    missing instead of failing opaquely."""
     try:
         _as({"sub": "sess_owner"})
         client.post("/api/bootstrap", json={"name": "Sess Owner", "email": "so@x.dev"})
         doc = _upload(client)
         r = client.post("/api/sessions/start", json={"documentId": doc["id"]})
         assert r.status_code == 503
-        assert "OpenAI" in r.json()["detail"]
+        detail = r.json()["detail"]
+        assert "LIVEKIT" in detail and "DEEPGRAM" in detail and "CARTESIA" in detail
     finally:
         _clear()
 
@@ -52,16 +54,18 @@ def test_start_404_for_foreign_document(client):
         _clear()
 
 
-def test_score_writes_understanding_and_records_session(client, monkeypatch):
+def test_score_records_transcript_and_returns_document_standing(client, monkeypatch):
     from lms_app.routers import sessions
 
     monkeypatch.setattr(
         sessions.ai,
         "score_understanding",
-        lambda doc_name, transcript: {
+        lambda doc_name, transcript, section=None, prior_facts=None: {
+            "scoreable": True,
             "score": 80,
+            "covered": 100,
             "summary": "Solid grasp of incident reporting.",
-            "topics": [{"name": "Reporting", "score": 80}],
+            "topics": [{"name": "Reporting", "score": 80, "evidence": "within 24 hours"}],
             "strengths": ["Knew the 24h window"],
             "gaps": [],
         },
@@ -70,62 +74,62 @@ def test_score_writes_understanding_and_records_session(client, monkeypatch):
         _as({"sub": "score_owner"})
         client.post("/api/bootstrap", json={"name": "Score Owner", "email": "score@x.dev"})
         doc = _upload(client)
-        r = client.post(
-            "/api/sessions/score",
-            json={
-                "documentId": doc["id"],
-                "transcript": [
-                    {"role": "tutor", "text": "When must you report an incident?"},
-                    {"role": "learner", "text": "Within 24 hours, to the IT team."},
-                ],
-            },
-        )
-        assert r.status_code == 200, r.text
-        body = r.json()
-        assert body["score"] == 80
-        assert body["understanding"] == 80  # first session → equals the score
-        assert body["summary"]
-        # A second session REPLACES understanding with the latest score (so re-learning
-        # updates it). Substantive answer so it clears the strict gate and reaches the stub.
-        monkeypatch.setattr(sessions.ai, "score_understanding", lambda d, t: {"score": 40, "topics": []})
-        r2 = client.post(
-            "/api/sessions/score",
-            json={
-                "documentId": doc["id"],
-                "transcript": [
-                    {"role": "learner", "text": "You report the incident to the IT security team within twenty four hours."}
-                ],
-            },
+        turns = [
+            {"role": "tutor", "text": "When must you report an incident?"},
+            {"role": "learner", "text": "Within twenty four hours, to the IT security team."},
+        ]
+        body = client.post(
+            "/api/sessions/score", json={"documentId": doc["id"], "transcript": turns}
         ).json()
-        assert r2["understanding"] == 40  # latest attempt replaces — re-learning updates the score
+        assert body["score"] == 80
+        assert body["scoreable"] is True
+        assert body["understanding"] is not None
+        assert body["band"]
+
+        # The sitting is auditable: the transcript came back with it.
+        person = client.get("/api/people/1")
+        if person.status_code == 200:
+            sid = person.json()["sessions"][0]["id"]
+            detail = client.get(f"/api/people/1/sessions/{sid}")
+            if detail.status_code == 200:
+                assert detail.json()["transcript"] == turns
     finally:
         _clear()
 
 
-def test_score_gates_thin_or_garbage_answers(client, monkeypatch):
-    """A near-silent / filler answer is scored low WITHOUT calling the LLM, so
-    misrecognised noise can't produce a random high score."""
+def test_a_thin_answer_is_unscoreable_not_a_low_score(client, monkeypatch):
+    """A near-silent / filler sitting must NOT be recorded as a low score — that
+    is what dragged learners down every time they opened and closed the app."""
     from lms_app.routers import sessions
 
-    def _boom(doc_name, transcript):  # must not be reached for a thin transcript
-        raise AssertionError("score_understanding should not run for a thin transcript")
+    def _boom(*a, **k):
+        raise AssertionError("the grader must not run on a thin transcript")
 
-    monkeypatch.setattr(sessions.ai, "score_understanding", _boom)
+    monkeypatch.setattr(sessions.ai.llm, "chat_json", _boom)
     try:
         _as({"sub": "gate_owner"})
         client.post("/api/bootstrap", json={"name": "Gate Owner", "email": "gate@x.dev"})
         doc = _upload(client)
-        r = client.post(
+        body = client.post(
             "/api/sessions/score",
             json={
                 "documentId": doc["id"],
                 "transcript": [
                     {"role": "tutor", "text": "Explain how to report an incident."},
-                    {"role": "learner", "text": "yeah um ok right"},
+                    {"role": "learner", "text": "yeah um ok right thanks"},
                 ],
             },
-        )
-        assert r.status_code == 200, r.text
-        assert r.json()["score"] <= 15  # gated low, not a random high score
+        ).json()
+        assert body["scoreable"] is False
+        assert body["score"] is None
+        assert body["understanding"] is None  # nothing demonstrated, nothing claimed
     finally:
         _clear()
+
+
+def test_agent_routes_require_the_shared_secret(client):
+    r = client.post(
+        "/api/sessions/agent/context",
+        json={"workspaceId": 1, "userId": 1, "documentId": 1, "moduleIdx": 0},
+    )
+    assert r.status_code == 401

@@ -4,17 +4,39 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .. import models, schemas, workspace
+from .. import models, plan as plan_service, workspace
 from ..auth import active_membership, current_user
 from ..db import get_db
 
 router = APIRouter(prefix="/api/documents", tags=["documents"], dependencies=[Depends(current_user)])
 
 
-@router.get("", response_model=list[schemas.DocumentOut])
-def list_documents(db: Session = Depends(get_db)) -> list[schemas.DocumentOut]:
-    rows = db.scalars(select(models.Document).order_by(models.Document.id)).all()
-    return [schemas.DocumentOut.model_validate(r) for r in rows]
+@router.get("")
+def list_documents(
+    user: models.User = Depends(active_membership), db: Session = Depends(get_db)
+) -> list[dict]:
+    rows = db.scalars(
+        select(models.Document)
+        .where(models.Document.workspace_id == user.workspace_id)
+        .order_by(models.Document.id)
+    ).all()
+    return [workspace.document_out(db, d) for d in rows]
+
+
+@router.get("/{document_id}/coverage")
+def plan_coverage(
+    document_id: int,
+    user: models.User = Depends(active_membership),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Does this document's teaching plan actually cover the whole document?
+
+    Surfaced because it silently did not: a 46-chunk document was planned from a
+    truncated prompt and the last 14 chunks were never taught to anyone."""
+    doc = db.get(models.Document, document_id)
+    if doc is None or doc.workspace_id != user.workspace_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    return plan_service.plan_coverage(db, document_id)
 
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)

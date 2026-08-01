@@ -112,7 +112,6 @@ def create_workspace(
             name=user.name,
             email=user.email,
             role="Admin",
-            cohort="—",
         )
     )
     db.commit()
@@ -130,14 +129,13 @@ def add_document(body: DocumentIn, user: models.User = Depends(active_membership
     doc = models.Document(
         workspace_id=user.workspace_id,
         name=name,
-        sections=max(0, body.sections),
-        assigned=0,
+        chunk_count=max(0, body.sections),
         status="Indexing",
     )
     db.add(doc)
     db.commit()
     db.refresh(doc)
-    return {"id": doc.id, "name": doc.name, "sections": doc.sections, "assigned": doc.assigned, "status": doc.status}
+    return workspace.document_out(db, doc)
 
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50MB, matches the UI copy
@@ -184,8 +182,7 @@ async def upload_document(
     doc = models.Document(
         workspace_id=user.workspace_id,
         name=name,
-        sections=0,
-        assigned=0,
+        chunk_count=0,
         status="Indexing",
         storage_path=(storage_path or None),
     )
@@ -196,13 +193,7 @@ async def upload_document(
     # Index off the request path so the upload returns immediately; the doc shows as
     # "Indexing" and flips to "Indexed" once embedding finishes.
     background.add_task(_index_in_background, doc.id, data)
-    return {
-        "id": doc.id,
-        "name": doc.name,
-        "sections": doc.sections,
-        "assigned": doc.assigned,
-        "status": doc.status,
-    }
+    return workspace.document_out(db, doc)
 
 
 @router.get("/team/invites")

@@ -1,4 +1,4 @@
-# Praxos LMS backend (Python 3.9+)
+# Praxos LMS backend (Python 3.11+)
 fastapi>=0.110
 uvicorn[standard]>=0.27
 SQLAlchemy>=2.0
@@ -9,12 +9,21 @@ PyJWT[crypto]>=2.8
 httpx>=0.27
 python-multipart>=0.0.9
 
-# Document pipeline: PDF text extraction, embeddings/scoring, pgvector storage
+# Document pipeline: PDF text extraction, embeddings/scoring, pgvector storage.
+# The `openai` SDK is used as an OpenAI-COMPATIBLE client — LLM_BASE_URL points
+# it at whichever provider is configured (see lms_app/llm.py).
 pypdf>=4.0
 openai>=1.40
 pgvector>=0.2.5
 
-# Postgres / Supabase driver (uncomment for production)
+# Conversation memory.
+mem0ai>=0.1
+
+# Voice: LiveKit room/token minting for the API. The agent worker's own deps
+# live in requirements-agent.txt so the API image stays small.
+livekit-api>=1.0
+
+# Postgres / Supabase driver (installed explicitly in the Dockerfile)
 # psycopg[binary]>=3.1
 
 # Dev / test

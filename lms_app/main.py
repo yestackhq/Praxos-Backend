@@ -5,12 +5,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from . import llm, poke
 from .config import settings
 from sqlalchemy import text
 
 from .db import Base, SessionLocal, engine, ensure_schema
-from .routers import admin, bootstrap, cohorts, documents, learner, sessions, teams
-from .seed import seed
+from .routers import bootstrap, cohorts, documents, sessions, teams
 
 
 def _ensure_pgvector() -> None:
@@ -40,6 +40,8 @@ def _ensure_columns() -> None:
         conn.execute(text(f"ALTER TABLE {q('teams')} ADD COLUMN IF NOT EXISTS published boolean NOT NULL DEFAULT false"))
         conn.execute(text(f"ALTER TABLE {q('modules')} ADD COLUMN IF NOT EXISTS chunk_start integer NOT NULL DEFAULT 0"))
         conn.execute(text(f"ALTER TABLE {q('modules')} ADD COLUMN IF NOT EXISTS chunk_end integer NOT NULL DEFAULT 0"))
+        conn.execute(text(f"ALTER TABLE {q('modules')} ADD COLUMN IF NOT EXISTS key_points json NOT NULL DEFAULT '[]'::json"))
+        conn.execute(text(f"ALTER TABLE {q('modules')} ADD COLUMN IF NOT EXISTS check_questions json NOT NULL DEFAULT '[]'::json"))
 
 
 def _ensure_membership_schema() -> None:
@@ -86,9 +88,6 @@ def init_db() -> None:
             workspace_svc.reconcile_memberships(db)
         except Exception:
             db.rollback()
-    if settings.SEED_ON_STARTUP:
-        with SessionLocal() as db:
-            seed(db)
 
 
 @asynccontextmanager
@@ -115,7 +114,18 @@ def health() -> dict:
         "service": settings.APP_NAME,
         "version": settings.VERSION,
         "auth_enabled": settings.auth_enabled,
-        "openai_enabled": settings.openai_enabled,
+        # What the deployment can actually do, so a misconfigured env is visible
+        # from /api/health instead of surfacing as a dead voice button.
+        "llm": {
+            "provider": settings.LLM_PROVIDER,
+            "model": settings.LLM_MODEL,
+            "enabled": llm.chat_enabled(),
+            "note": poke.inference_unavailable_reason(),
+        },
+        "embeddings_enabled": llm.embed_enabled(),
+        "voice_enabled": settings.voice_enabled,
+        "memory_enabled": settings.memory_enabled,
+        "poke_enabled": poke.enabled(),
     }
 
 
@@ -133,8 +143,6 @@ def workspace() -> dict:
 
 
 app.include_router(bootstrap.router)
-app.include_router(learner.router)
-app.include_router(admin.router)
 app.include_router(documents.router)
 app.include_router(sessions.router)
 app.include_router(cohorts.router)

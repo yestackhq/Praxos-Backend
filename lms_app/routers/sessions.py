@@ -2,36 +2,38 @@ from __future__ import annotations
 
 """Voice teaching sessions.
 
-  start  → builds tutor instructions grounded in the document's indexed text and
-           mints an ephemeral OpenAI Realtime token the browser uses to open a
-           WebRTC voice connection directly to OpenAI (the API key never reaches
-           the client).
-  score  → grades the session transcript with an LLM into an understanding
-           score (0-100), writes it back to the learner, and records the session.
+  start   → creates a LiveKit room carrying the learner/document/section ids and
+            returns a short-lived join token. The agent worker (voice_agent/)
+            is dispatched into that room and runs Deepgram → LLM → Cartesia.
+  section → instructions for advancing mid-session, without reconnecting.
+  score   → grades a sitting against the section's key points and source text,
+            records the transcript, and folds the result into the learner's
+            standing (see scoring.py).
+
+The agent worker authenticates with the shared ``AGENT_SHARED_SECRET`` on the
+``/agent/*`` routes; learners authenticate with their Clerk session as usual.
 """
 
-import re
-from datetime import date
+import secrets
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .. import ai, indexing, memory, models, plan as plan_service, workspace
+from .. import ai, memory, models, plan as plan_service, poke, scoring, tutor, voice
 from ..auth import active_membership
+from ..config import settings
 from ..db import get_db
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
-
-MAX_CONTEXT_CHARS = 6000
 
 
 class StartIn(BaseModel):
     documentId: int
     moduleIdx: Optional[int] = None  # explicit section; else resume at the saved point
-    restart: bool = False  # re-learn from the first section (reset saved progress)
+    restart: bool = False  # re-learn from the first section
 
 
 class Turn(BaseModel):
@@ -53,170 +55,114 @@ def _doc_in_workspace(db: Session, document_id: int, ws_id: int) -> models.Docum
     return doc
 
 
-def _progress_row(db: Session, user_id: int, document_id: int) -> Optional[models.SectionProgress]:
-    return db.scalar(
-        select(models.SectionProgress).where(
-            models.SectionProgress.user_id == user_id,
-            models.SectionProgress.document_id == document_id,
-        )
-    )
-
-
-def _section_chunks(doc: models.Document, mod: Optional[models.Module]) -> list[str]:
-    """The text the tutor teaches from: just this section's chunk range when there
-    is a plan, else the first few chunks (un-planned document)."""
-    if mod is not None and mod.chunk_end > mod.chunk_start:
-        return [c.content for c in doc.chunks if mod.chunk_start <= c.idx < mod.chunk_end]
-    return [c.content for c in doc.chunks][:8]
-
-
-def _build_instructions(
+def _instructions_for(
+    db: Session,
+    *,
+    user: models.User,
     doc: models.Document,
-    modules: list[models.Module],
     idx: int,
-    recap: str = "",
     resumed: bool = False,
     advancing: bool = False,
-) -> str:
+    with_recap: bool = True,
+) -> tuple[str, list[models.Module]]:
+    modules = plan_service.get_modules(db, doc.id)
     cur = modules[idx] if modules and 0 <= idx < len(modules) else None
-    context = "\n\n".join(_section_chunks(doc, cur))[:MAX_CONTEXT_CHARS]
-
-    if advancing:
-        memory_block = (
-            "\n\nThe learner just finished the previous section. In ONE sentence recap what it "
-            "covered, then immediately start teaching THIS section. Do not greet or re-introduce yourself.\n"
+    recap = ""
+    if with_recap and not advancing:
+        recap = memory.recap_for_tutor(
+            workspace_id=user.workspace_id,
+            user_id=user.id,
+            document_id=doc.id,
+            doc_name=doc.name,
         )
-    elif recap:
-        memory_block = (
-            f"\n\n{recap}\n"
-            "You have taught this learner before. Do NOT introduce yourself. Give a ONE-line recap of "
-            "where they left off, then continue teaching this section.\n"
-        )
-    else:
-        memory_block = (
-            "\n\nStart teaching THIS section directly — do NOT introduce yourself or summarise the "
-            "document. Open with the first key point and a question.\n"
-        )
-
-    plan_block = ""
-    section_block = ""
-    if modules:
-        outline = "\n".join(
-            f"  {i + 1}. {m.title}" + ("  ← teaching now" if i == idx else "")
-            for i, m in enumerate(modules)
-        )
-        plan_block = f"\n--- COURSE OUTLINE ({len(modules)} sections) ---\n{outline}\n"
-    if cur is not None:
-        topics = ", ".join(str(t) for t in (cur.topics or []))
-        section_block = (
-            f"\nYou are teaching SECTION {idx + 1} of {len(modules)}: \"{cur.title}\". "
-            f"Aim: {cur.description} "
-            + (f"Make sure to cover: {topics}. " if topics else "")
-            + "Teach ONLY this section now. When the learner has correctly EXPLAINED this section's "
-            "idea in their own words (not merely agreed or thanked you), CALL the "
-            "`ready_for_next_section` tool AND, in that same turn, tell them out loud in one short "
-            "sentence that they've completed this section and can tap the on-screen button to "
-            "continue whenever they're ready. NEVER call the tool silently — always speak. Keep "
-            "teaching and probing until they can explain it. You CANNOT switch sections yourself — "
-            "only the learner's on-screen button advances. So if, after you've signalled readiness, "
-            "the learner says they want to move on, simply and warmly tell them to tap the button "
-            "(e.g. 'Tap Next section and we'll dive right in') — never say you 'can't', never "
-            "apologise, and never promise to teach the next section in this turn. If they keep "
-            "discussing THIS section, keep helping."
-        )
-        if modules and idx >= len(modules) - 1:
-            section_block += (
-                " This is the FINAL section: once they understand it, briefly wrap up the whole "
-                "document in a sentence or two, then call `ready_for_next_section`."
-            )
-        if resumed:
-            section_block += (
-                " The learner PAUSED partway through this section last time — recall from your "
-                "memory of the conversation where you left off, briefly recap, and CONTINUE from "
-                "there. Do NOT restart the section from the beginning."
-            )
-
-    return (
-        f"You are Praxos, a warm but RIGOROUS voice tutor teaching '{doc.name}'. Teach "
-        "conversationally in short turns: explain a key point, then ask a question that makes the "
-        "learner EXPLAIN the idea in their own words. Ground your teaching in the SECTION MATERIAL "
-        "below; explain it in your own words and use general knowledge only to clarify or give "
-        "everyday examples, never to add facts that contradict it. You ALWAYS have the material you "
-        "need — NEVER claim a section's text is missing or unavailable, and NEVER ask the learner to "
-        "paste, type, share, upload, or provide any document, section, or text (this is a voice "
-        "conversation; they cannot send you text). If a section's material is brief, just teach the "
-        "concept it states concisely. Keep replies under three sentences. Speak FIRST the moment the "
-        "session begins — start teaching immediately; do NOT introduce yourself or greet at length; "
-        "never sit silently.\n"
-        "RIGOR (critical): acknowledgements and filler are NOT answers. If the learner only says "
-        "things like 'thank you', 'ok', 'yeah', 'mm', 'right', 'got it', stays silent, gives a single "
-        "word, or says something off-topic or that sounds like stray background speech, do NOT say "
-        "'exactly/right/correct', do NOT give credit, do NOT call the tool, and do NOT move on. Ask "
-        "them to explain it in their own words, or re-ask. If unsure you heard a real answer, ask "
-        "them to repeat it."
-        f"{memory_block}{plan_block}{section_block}"
-        f"\n--- SECTION MATERIAL ---\n{context}"
+    text = tutor.build_instructions(
+        doc_name=doc.name,
+        sections=[plan_service.module_payload(m) for m in modules],
+        idx=idx,
+        material=tutor.section_material(plan_service.section_chunks(doc, cur)),
+        recap=recap,
+        resumed=resumed,
+        advancing=advancing,
     )
+    return text, modules
 
 
 @router.post("/start")
-def start_session(body: StartIn, user: models.User = Depends(active_membership), db: Session = Depends(get_db)) -> dict:
+def start_session(
+    body: StartIn,
+    user: models.User = Depends(active_membership),
+    db: Session = Depends(get_db),
+) -> dict:
+    # Validate the request before reporting server state, so a request for someone
+    # else's document is a 404 whether or not voice happens to be configured.
     doc = _doc_in_workspace(db, body.documentId, user.workspace_id)
+    if not settings.voice_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Voice teaching needs LIVEKIT_URL/API_KEY/API_SECRET, DEEPGRAM_API_KEY and "
+                "CARTESIA_API_KEY on the server."
+            ),
+        )
     modules = plan_service.get_modules(db, doc.id)
-    prog = _progress_row(db, user.id, doc.id)
+    total = len(modules)
 
-    # Re-learn: reset saved progress + re-open the path item, so a learner can redo a
-    # mastered or low-scoring document from the first section to raise their understanding.
     if body.restart:
-        if prog is not None:
-            prog.module_idx = 0
-            prog.status = "in_progress"
-            prog.score = None
+        # Re-learn from the start. Past bests are DELIBERATELY kept — a learner
+        # revisiting a document should be able to raise their score, not be forced
+        # to re-earn ground they already demonstrated.
+        for p in db.scalars(
+            select(models.SectionProgress).where(
+                models.SectionProgress.user_id == user.id,
+                models.SectionProgress.document_id == doc.id,
+            )
+        ).all():
+            p.status = "in_progress"
         item = db.scalar(
             select(models.LearningPathItem).where(
                 models.LearningPathItem.user_id == user.id,
-                models.LearningPathItem.title == doc.name,
+                models.LearningPathItem.document_id == doc.id,
             )
         )
         if item is not None and item.status == "mastered":
             item.status = "in_progress"
-            item.progress = 0
         db.flush()
-
-    # Which section to teach: restart → first; an explicit override; else the saved point.
-    if body.restart:
         idx = 0
     elif body.moduleIdx is not None:
         idx = body.moduleIdx
-    elif prog is not None:
-        idx = prog.module_idx
     else:
-        idx = 0
-    idx = max(0, min(idx, max(0, len(modules) - 1)))
-    resumed = bool(
-        prog is not None
-        and prog.status == "paused"
-        and (body.moduleIdx is None or body.moduleIdx == prog.module_idx)
-    )
+        idx = scoring.next_section_idx(db, user.id, doc.id, total)
+    idx = max(0, min(idx, max(0, total - 1)))
 
-    # Restore what we already know about this learner (incl. the published lesson
-    # plan + any paused conversation) so the tutor opens confidently. Empty string
-    # for a brand-new learner / if memory is unconfigured or slow.
-    recap = memory.recap_for_tutor(
-        workspace_id=user.workspace_id,
-        user_id=user.id,
-        document_id=doc.id,
-        doc_name=doc.name,
+    prog = db.scalar(
+        select(models.SectionProgress).where(
+            models.SectionProgress.user_id == user.id,
+            models.SectionProgress.document_id == doc.id,
+            models.SectionProgress.module_idx == idx,
+        )
     )
-    instructions = _build_instructions(doc, modules, idx, recap, resumed)
-    realtime = ai.mint_realtime_session(instructions)
-    if realtime is None:
+    resumed = bool(prog is not None and prog.status == "paused")
+
+    nonce = secrets.token_hex(4)
+    room = voice.room_name(
+        user_id=user.id, document_id=doc.id, module_idx=idx, session_nonce=nonce
+    )
+    token = voice.mint_join_token(
+        room=room,
+        identity=f"learner-{user.id}",
+        name=user.name,
+        metadata=voice.room_metadata(
+            workspace_id=user.workspace_id,
+            user_id=user.id,
+            document_id=doc.id,
+            module_idx=idx,
+        ),
+    )
+    if not token:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Voice teaching needs an OpenAI API key on the server.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="LiveKit is not configured."
         )
 
-    # Mark this section in-progress so closing + reopening resumes it.
     if prog is None:
         db.add(
             models.SectionProgress(
@@ -224,21 +170,20 @@ def start_session(body: StartIn, user: models.User = Depends(active_membership),
             )
         )
     else:
-        prog.module_idx = idx
         prog.status = "in_progress"
     db.commit()
 
-    # The ephemeral client secret is the top-level ``value`` (GA Realtime API).
     return {
         "document": {"id": doc.id, "name": doc.name},
-        "clientSecret": realtime.get("value"),
-        "expiresAt": realtime.get("expires_at"),
-        "returning": bool(recap),  # frontend can show "Welcome back" vs "Let's begin"
+        "livekitUrl": settings.LIVEKIT_URL,
+        "room": room,
+        "token": token,
         "moduleIdx": idx,
         "moduleTitle": modules[idx].title if modules else None,
-        "totalModules": len(modules),
-        "isLast": idx >= len(modules) - 1 if modules else True,
+        "totalModules": total,
+        "isLast": idx >= total - 1 if total else True,
         "resumed": resumed,
+        "returning": bool(scoring.section_bests(db, user.id, doc.id)),
     }
 
 
@@ -248,152 +193,264 @@ class SectionIn(BaseModel):
 
 
 @router.post("/section")
-def section_instructions(body: SectionIn, user: models.User = Depends(active_membership), db: Session = Depends(get_db)) -> dict:
-    """Instructions for advancing to a section MID-session — the client sends these via a
-    realtime session.update so the tutor moves on WITHOUT reconnecting (keeps context, no
-    re-intro). Recap framing is baked in (advancing=True)."""
+def section_instructions(
+    body: SectionIn,
+    user: models.User = Depends(active_membership),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Instructions for advancing to a section MID-session — sent to the agent so
+    it moves on without reconnecting (keeps context, no re-introduction)."""
     doc = _doc_in_workspace(db, body.documentId, user.workspace_id)
     modules = plan_service.get_modules(db, doc.id)
     idx = max(0, min(body.moduleIdx, max(0, len(modules) - 1)))
+    text, _ = _instructions_for(db, user=user, doc=doc, idx=idx, advancing=True, with_recap=False)
     cur = modules[idx] if modules else None
     return {
         "moduleIdx": idx,
         "moduleTitle": cur.title if cur else None,
         "totalModules": len(modules),
         "isLast": idx >= len(modules) - 1 if modules else True,
-        "instructions": _build_instructions(doc, modules, idx, advancing=True),
+        "instructions": text,
     }
+
+
+def _grade(
+    db: Session,
+    *,
+    user: models.User,
+    doc: models.Document,
+    module_idx: int,
+    transcript: list[dict],
+) -> Optional[dict]:
+    """Run the assessor with the section's plan and source text as ground truth.
+    Grading a transcript without them — which is what used to happen — leaves the
+    model guessing whether an answer is right, and produces the clustered 41/65/70
+    scores seen in the history."""
+    modules = plan_service.get_modules(db, doc.id)
+    cur = modules[module_idx] if modules and 0 <= module_idx < len(modules) else None
+    section = None
+    if cur is not None:
+        section = plan_service.module_payload(cur)
+        section["material"] = tutor.section_material(plan_service.section_chunks(doc, cur))
+    prior = memory.prior_understanding(
+        workspace_id=user.workspace_id,
+        user_id=user.id,
+        document_id=doc.id,
+        topic=(cur.title if cur else doc.name),
+    )
+    return ai.score_understanding(doc.name, transcript, section=section, prior_facts=prior)
 
 
 @router.post("/score")
-def score_session(body: ScoreIn, user: models.User = Depends(active_membership), db: Session = Depends(get_db)) -> dict:
+def score_session(
+    body: ScoreIn,
+    user: models.User = Depends(active_membership),
+    db: Session = Depends(get_db),
+) -> dict:
     doc = _doc_in_workspace(db, body.documentId, user.workspace_id)
-
     transcript = [{"role": t.role, "text": t.text} for t in body.transcript if t.text.strip()]
+    modules = plan_service.get_modules(db, doc.id)
+    total = len(modules)
 
-    # Noise-proof gate: if the learner said essentially NOTHING (silence/noise →
-    # empty or pure filler), skip the LLM and score low. Real answers — even short or
-    # numeric ones — go to the strict rubric in score_understanding, which judges them.
-    _filler = {
-        "yeah", "yes", "no", "ok", "okay", "um", "uh", "hmm", "mhm", "mm",
-        "right", "sure", "nope", "yep", "what", "huh", "idk", "dunno", "the", "a", "i",
-        "thank", "thanks", "you", "thankyou", "please",
-    }
-    learner_text = " ".join(t["text"] for t in transcript if t["role"] == "learner")
-    substantive = [w for w in re.findall(r"[a-z0-9']+", learner_text.lower()) if w not in _filler]
-    if not substantive:
-        result = {
-            "score": 10,
-            "summary": "Not enough was said to show understanding — explain the material in your own words.",
-            "topics": [],
-            "strengths": [],
-            "gaps": ["Give a full spoken explanation of the section."],
-        }
-    else:
-        result = ai.score_understanding(doc.name, transcript)
-        if result is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Scoring needs an OpenAI API key on the server.",
-            )
-
-    score = result["score"]
-    # Understanding reflects the learner's LATEST attempt — so re-learning a document
-    # immediately raises (or lowers) it, instead of being capped by an average.
-    user.understanding = score
-    learner_turns = sum(1 for t in transcript if t["role"] == "learner")
-    session_row = models.LearningSession(
-        user_id=user.id,
-        doc=doc.name,
-        date=date.today().isoformat(),
-        score=score,
-        duration=f"{max(1, learner_turns)} exchanges",
-        topics=f"{len(result.get('topics', []))} topics",
+    prog_idx = db.scalar(
+        select(models.SectionProgress.module_idx)
+        .where(
+            models.SectionProgress.user_id == user.id,
+            models.SectionProgress.document_id == doc.id,
+        )
+        .order_by(models.SectionProgress.updated_at.desc())
     )
-    db.add(session_row)
+    module_idx = body.moduleIdx if body.moduleIdx is not None else int(prog_idx or 0)
+    module_idx = max(0, min(module_idx, max(0, total - 1)))
+
+    result = _grade(db, user=user, doc=doc, module_idx=module_idx, transcript=transcript)
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Scoring needs an AI provider on the server (set LLM_API_KEY).",
+        )
+
+    session_row = scoring.apply_session(
+        db,
+        user=user,
+        document=doc,
+        module_idx=module_idx,
+        transcript=transcript,
+        result=result,
+        paused=body.paused,
+        total_sections=total,
+    )
     db.commit()
     db.refresh(session_row)
 
-    # Persist this session to conversation memory so the next session can recall
-    # it. Async ingest (returns fast); a distilled summary rides along so the
-    # learner's strengths/gaps become queryable facts. Best-effort — a memory
-    # outage must never fail scoring.
-    summary_bits: list[str] = []
-    if result.get("summary"):
-        summary_bits.append(str(result["summary"]))
+    # Persist to memory so the next sitting can recall it. Best-effort.
+    summary_bits = [str(result.get("summary") or "")]
     if result.get("strengths"):
-        summary_bits.append("Strengths: " + "; ".join(map(str, result["strengths"])))
+        summary_bits.append("Demonstrated: " + "; ".join(map(str, result["strengths"])))
     if result.get("gaps"):
-        summary_bits.append("Gaps to revisit next time: " + "; ".join(map(str, result["gaps"])))
+        summary_bits.append("Still to revisit: " + "; ".join(map(str, result["gaps"])))
     memory.write_session(
         workspace_id=user.workspace_id,
         user_id=user.id,
         document_id=doc.id,
-        conversation_id=f"praxos-sess-{session_row.id}",
+        session_id=session_row.id,
+        module_idx=module_idx,
         transcript=transcript,
-        summary=" ".join(summary_bits) or None,
-        sync=False,
+        summary=" ".join(b for b in summary_bits if b.strip()) or None,
     )
 
-    # Advance section progress: a pause keeps the same section (resume later); a
-    # finished section moves the resume point forward and bumps the path %.
-    modules = plan_service.get_modules(db, doc.id)
-    last = max(0, len(modules) - 1)
-    prog = _progress_row(db, user.id, doc.id)
-    cur_idx = body.moduleIdx if body.moduleIdx is not None else (prog.module_idx if prog else 0)
-    if prog is None:
-        prog = models.SectionProgress(user_id=user.id, document_id=doc.id, module_idx=cur_idx)
-        db.add(prog)
-    if body.paused:
-        prog.module_idx = cur_idx
-        prog.status = "paused"
-    elif cur_idx < last:
-        prog.module_idx = cur_idx + 1
-        prog.status = "in_progress"
-    else:
-        prog.module_idx = last
-        prog.status = "completed"
-    prog.score = score
-
-    if modules:
-        done = cur_idx if body.paused else cur_idx + 1
-        pct = min(100, round(100 * done / len(modules)))
-        item = db.scalar(
-            select(models.LearningPathItem).where(
-                models.LearningPathItem.user_id == user.id,
-                models.LearningPathItem.title == doc.name,
-            )
-        )
-        if item is not None:
-            item.progress = pct
-            if pct >= 100:
-                item.status = "mastered"
-                # Unlock the next document in the path so a multi-document / EXPANDED
-                # cohort flows forward — a doc added later becomes learnable in turn,
-                # without disturbing anything the learner has already done.
-                nxt = db.scalar(
-                    select(models.LearningPathItem)
-                    .where(
-                        models.LearningPathItem.user_id == user.id,
-                        models.LearningPathItem.status == "locked",
-                    )
-                    .order_by(models.LearningPathItem.idx)
-                )
-                if nxt is not None:
-                    nxt.status = "up_next"
-            else:
-                item.status = "in_progress"
-    db.commit()
+    doc_score = scoring.document_understanding(db, user.id, doc.id)
+    completion = scoring.document_completion(db, user.id, doc.id)
+    _maybe_notify(db, user=user, doc=doc, doc_score=doc_score, completion=completion)
 
     return {
-        "score": score,
-        "understanding": user.understanding,
+        # This sitting.
+        "score": session_row.score,
+        "scoreable": session_row.score is not None,
         "summary": result.get("summary", ""),
         "topics": result.get("topics", []),
         "strengths": result.get("strengths", []),
         "gaps": result.get("gaps", []),
-        "moduleIdx": prog.module_idx,
-        "totalModules": len(modules),
-        "courseComplete": prog.status == "completed",
+        # Where the learner now stands — the number the admin sees, not the last sitting.
+        "understanding": doc_score,
+        "band": scoring.band(doc_score),
+        "documentUnderstanding": doc_score,
+        "completion": completion,
+        "sectionBests": scoring.section_bests(db, user.id, doc.id),
+        "moduleIdx": module_idx,
+        "totalModules": total,
+        "courseComplete": completion >= 100,
         "paused": body.paused,
     }
+
+
+def _maybe_notify(
+    db: Session,
+    *,
+    user: models.User,
+    doc: models.Document,
+    doc_score: Optional[int],
+    completion: int,
+) -> None:
+    """Opt-in Poke nudges for the admin. Poke can't run the lesson, but it is a
+    fine place to land 'this learner needs help'."""
+    if not (settings.POKE_NOTIFY_AT_RISK and poke.enabled() and doc_score is not None):
+        return
+    ws = db.get(models.Workspace, user.workspace_id)
+    ws_name = ws.name if ws else f"workspace {user.workspace_id}"
+    if completion >= 100:
+        poke.notify_document_complete(
+            learner=user.name, document=doc.name, score=doc_score, workspace=ws_name
+        )
+    elif doc_score < settings.AT_RISK_THRESHOLD:
+        poke.notify_at_risk(
+            learner=user.name, document=doc.name, score=doc_score, workspace=ws_name
+        )
+
+
+# ---------------------------------------------------------------------------
+# Agent-worker routes. Authenticated with the shared secret, not a learner JWT.
+# ---------------------------------------------------------------------------
+
+
+def _agent_auth(x_agent_secret: str = Header(default="")) -> None:
+    expected = settings.AGENT_SHARED_SECRET
+    if not expected or not secrets.compare_digest(x_agent_secret, expected):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bad agent secret")
+
+
+class AgentContextIn(BaseModel):
+    workspaceId: int
+    userId: int
+    documentId: int
+    moduleIdx: int = 0
+    advancing: bool = False
+
+
+@router.post("/agent/context", dependencies=[Depends(_agent_auth)])
+def agent_context(body: AgentContextIn, db: Session = Depends(get_db)) -> dict:
+    """Everything the worker needs to teach one section: grounded instructions,
+    the section plan, and the advancement tool schema."""
+    user = db.get(models.User, body.userId)
+    doc = db.get(models.Document, body.documentId)
+    if user is None or doc is None or doc.workspace_id != user.workspace_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown session")
+    modules = plan_service.get_modules(db, doc.id)
+    idx = max(0, min(body.moduleIdx, max(0, len(modules) - 1)))
+    prog = db.scalar(
+        select(models.SectionProgress).where(
+            models.SectionProgress.user_id == user.id,
+            models.SectionProgress.document_id == doc.id,
+            models.SectionProgress.module_idx == idx,
+        )
+    )
+    text, _ = _instructions_for(
+        db,
+        user=user,
+        doc=doc,
+        idx=idx,
+        resumed=bool(prog is not None and prog.status == "paused"),
+        advancing=body.advancing,
+    )
+    return {
+        "instructions": text,
+        "learnerName": user.name,
+        "document": {"id": doc.id, "name": doc.name},
+        "moduleIdx": idx,
+        "moduleTitle": modules[idx].title if modules else None,
+        "totalModules": len(modules),
+        "isLast": idx >= len(modules) - 1 if modules else True,
+        "tool": tutor.ADVANCE_TOOL,
+        "tts": {"model": settings.CARTESIA_MODEL, "voice": settings.CARTESIA_VOICE},
+        "stt": {"model": settings.DEEPGRAM_MODEL, "language": settings.DEEPGRAM_LANGUAGE},
+    }
+
+
+class AgentScoreIn(BaseModel):
+    workspaceId: int
+    userId: int
+    documentId: int
+    moduleIdx: int = 0
+    transcript: list[Turn] = []
+    paused: bool = False
+
+
+@router.post("/agent/score", dependencies=[Depends(_agent_auth)])
+def agent_score(body: AgentScoreIn, db: Session = Depends(get_db)) -> dict:
+    """The worker posts the finished sitting here if the browser never did (tab
+    closed, network dropped) — so a real conversation is never lost unscored."""
+    user = db.get(models.User, body.userId)
+    doc = db.get(models.Document, body.documentId)
+    if user is None or doc is None or doc.workspace_id != user.workspace_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown session")
+    transcript = [{"role": t.role, "text": t.text} for t in body.transcript if t.text.strip()]
+    if not transcript:
+        return {"recorded": False}
+
+    modules = plan_service.get_modules(db, doc.id)
+    idx = max(0, min(body.moduleIdx, max(0, len(modules) - 1)))
+    result = _grade(db, user=user, doc=doc, module_idx=idx, transcript=transcript)
+    if result is None:
+        return {"recorded": False, "reason": "no AI provider configured"}
+    row = scoring.apply_session(
+        db,
+        user=user,
+        document=doc,
+        module_idx=idx,
+        transcript=transcript,
+        result=result,
+        paused=body.paused,
+        total_sections=len(modules),
+    )
+    db.commit()
+    db.refresh(row)
+    memory.write_session(
+        workspace_id=user.workspace_id,
+        user_id=user.id,
+        document_id=doc.id,
+        session_id=row.id,
+        module_idx=idx,
+        transcript=transcript,
+        summary=str(result.get("summary") or "") or None,
+    )
+    return {"recorded": True, "sessionId": row.id, "score": row.score}

@@ -43,14 +43,12 @@ def _set_documents(db: Session, team: models.Team, doc_ids: list[int]) -> None:
     db.execute(delete(models.TeamDocument).where(models.TeamDocument.team_id == team.id))
     for idx, did in enumerate(doc_ids):
         db.add(models.TeamDocument(team_id=team.id, document_id=did, idx=idx))
-    team.paths = len(doc_ids)
 
 
 def _set_members(db: Session, team: models.Team, member_ids: list[int]) -> None:
     db.execute(delete(models.TeamMember).where(models.TeamMember.team_id == team.id))
     for uid in member_ids:
         db.add(models.TeamMember(team_id=team.id, user_id=uid))
-    team.members = len(member_ids)
 
 
 @router.post("/teams", status_code=status.HTTP_201_CREATED)
@@ -114,10 +112,7 @@ def publish_team(tid: int, user: models.User = Depends(_admin), db: Session = De
         doc = db.get(models.Document, did)
         if doc is None:
             continue
-        payload = [
-            {"idx": m.idx, "title": m.title, "description": m.description, "topics": m.topics}
-            for m in mods
-        ]
+        payload = [plan_service.module_payload(m) for m in mods]
         for uid in member_ids:
             try:
                 memory.write_lesson_plan(
@@ -129,9 +124,8 @@ def publish_team(tid: int, user: models.User = Depends(_admin), db: Session = De
                 )
             except Exception:
                 pass
-            _seed_path(db, uid, doc, len(mods))
+            _seed_path(db, uid, doc)
             _seed_progress(db, uid, did)
-        doc.assigned = max(doc.assigned, len(member_ids))
     t.published = True
     db.commit()
     db.refresh(t)
