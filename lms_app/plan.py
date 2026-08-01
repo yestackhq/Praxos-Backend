@@ -53,12 +53,32 @@ def ensure_plan(
     return existing if existing else generate_plan(db, document_id, end_user=end_user)
 
 
+class PlanGenerationError(RuntimeError):
+    """A model was available but produced no usable plan."""
+
+
 def generate_plan(
-    db: Session, document_id: int, *, end_user: Optional[llm.EndUser] = None
+    db: Session,
+    document_id: int,
+    *,
+    end_user: Optional[llm.EndUser] = None,
+    allow_fallback: Optional[bool] = None,
 ) -> list[models.Module]:
     """(Re)generate a document's plan from its chunks, replacing any existing
-    modules. Falls back to evenly-sized sections when no model is available, so
-    the section structure always exists."""
+    modules.
+
+    The even-split fallback exists for ONE case: no model is configured, and the
+    document still needs some section structure to be teachable. It must not
+    cover for a model that answered with nothing usable — a fallback plan has no
+    key_points, so the tutor cannot check understanding and the grader has no
+    ground truth, and it looks identical to a real plan in the admin UI. That is
+    how a document silently ended up with four keyless sections during a bulk
+    regeneration.
+
+    So when a model IS available and returns nothing usable, this raises rather
+    than quietly downgrading the document. Pass ``allow_fallback=True`` to opt
+    back into the old behaviour.
+    """
     doc = db.get(models.Document, document_id)
     if doc is None:
         return []
@@ -71,6 +91,12 @@ def generate_plan(
         else None
     )
     if not sections:
+        model_available = llm.chat_enabled() and bool(chunks)
+        if model_available and not (allow_fallback is True):
+            raise PlanGenerationError(
+                f"The model returned no usable plan for '{doc.name}'. The existing plan was "
+                "left untouched; retry rather than teaching from an unchecked one."
+            )
         sections = _fallback_sections(doc.name, len(chunks))
 
     db.execute(delete(models.Module).where(models.Module.document_id == document_id))

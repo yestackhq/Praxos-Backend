@@ -172,7 +172,12 @@ def publish_cohort(
     # so completed learners aren't forced to redo everything.
     fresh = not c.published
     for did in doc_ids:
-        mods = plan_service.ensure_plan(db, did, end_user=llm.EndUser.verified(token))
+        try:
+            mods = plan_service.ensure_plan(db, did, end_user=llm.EndUser.verified(token))
+        except plan_service.PlanGenerationError as exc:
+            # Publishing a cohort whose document has no teachable plan would put
+            # learners in front of a tutor with nothing to check them against.
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from None
         doc = db.get(models.Document, did)
         if doc is None:
             continue
@@ -323,6 +328,10 @@ def regenerate_plan(
         from .sessions import _meldos_http_error
 
         raise _meldos_http_error(exc) from None
+    except plan_service.PlanGenerationError as exc:
+        # The old plan is still in place; say so rather than leaving the admin to
+        # discover they now have a plan with nothing to check against.
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from None
     return {
         "document": {"id": doc.id, "name": doc.name},
         "modules": [_mod_out(m) for m in mods],

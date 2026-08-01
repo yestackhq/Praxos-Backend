@@ -89,3 +89,70 @@ def test_planner_sees_every_chunk_of_a_long_document():
     # Excerpts shrink to fit rather than chunks being dropped.
     assert len(corpus) < 200 * len(chunks[0])
     assert f"[chunk 199]\n{chunks[199][:PLAN_MIN_EXCERPT]}"[:60] in corpus
+
+
+# ---- a model that answers with nothing usable must not downgrade a document ---
+
+
+def _doc_with_chunks(db, n=4):
+    from lms_app import models
+
+    ws = models.Workspace(name="PlanCo", plan="x")
+    db.add(ws)
+    db.flush()
+    doc = models.Document(workspace_id=ws.id, name="Plan Doc.pdf", chunk_count=n)
+    db.add(doc)
+    db.flush()
+    for i in range(n):
+        db.add(models.DocumentChunk(document_id=doc.id, idx=i, content=f"chunk {i} text"))
+    db.flush()
+    return doc
+
+
+def test_unusable_model_output_raises_instead_of_silently_falling_back(client, monkeypatch):
+    """The even-split fallback is for 'no model configured'. If a model IS there
+    and returns nothing usable, falling back produces a plan with no key_points —
+    the tutor cannot check understanding, the grader has no ground truth, and it
+    is indistinguishable from a real plan in the UI. That happened to a live
+    document during a bulk regeneration."""
+    import pytest
+
+    from lms_app import llm, plan as plan_service
+    from lms_app.db import SessionLocal
+
+    with SessionLocal() as db:
+        doc = _doc_with_chunks(db)
+        db.add_all([
+            __import__("lms_app.models", fromlist=["models"]).Module(
+                document_id=doc.id, idx=0, title="Existing", minutes=5, chunk_start=0, chunk_end=4,
+                key_points=["a real key point"],
+            )
+        ])
+        db.commit()
+
+        monkeypatch.setattr(llm, "chat_enabled", lambda: True)
+        monkeypatch.setattr(plan_service.ai, "generate_lesson_plan", lambda *a, **k: None)
+
+        with pytest.raises(plan_service.PlanGenerationError):
+            plan_service.generate_plan(db, doc.id)
+
+        # And the previous plan must survive — a failed regeneration is not a reason
+        # to leave the document with nothing.
+        mods = plan_service.get_modules(db, doc.id)
+        assert [m.title for m in mods] == ["Existing"]
+        assert mods[0].key_points == ["a real key point"]
+
+
+def test_fallback_still_applies_when_no_model_is_configured(client, monkeypatch):
+    from lms_app import llm, plan as plan_service
+    from lms_app.db import SessionLocal
+
+    with SessionLocal() as db:
+        doc = _doc_with_chunks(db)
+        db.commit()
+        monkeypatch.setattr(llm, "chat_enabled", lambda: False)
+        monkeypatch.setattr(plan_service.ai, "generate_lesson_plan", lambda *a, **k: None)
+
+        mods = plan_service.generate_plan(db, doc.id)
+        assert mods, "a document with no model must still get teachable structure"
+        assert plan_service.plan_coverage(db, doc.id)["complete"]

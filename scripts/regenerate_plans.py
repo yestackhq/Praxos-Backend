@@ -25,6 +25,7 @@ from sqlalchemy import func, select
 from lms_app import models, plan as plan_service
 from lms_app.db import SessionLocal
 from lms_app.meldos import MeldOSError
+from lms_app.plan import PlanGenerationError
 
 MAX_ATTEMPTS = 3
 
@@ -77,10 +78,12 @@ def main(argv: list[str]) -> int:
                 started = time.monotonic()
                 try:
                     mods = plan_service.generate_plan(db, doc.id)
-                except MeldOSError as exc:
+                except (MeldOSError, PlanGenerationError) as exc:
                     wait = 5 * attempt
-                    print(f"{label}: MeldOS {exc.status} (attempt {attempt}) — retrying in {wait}s")
+                    why = f"MeldOS {exc.status}" if isinstance(exc, MeldOSError) else "no usable plan"
+                    print(f"{label}: {why} (attempt {attempt}) — retrying in {wait}s")
                     if attempt == MAX_ATTEMPTS:
+                        print(f"{label}: GAVE UP — existing plan left untouched")
                         failed += 1
                         break
                     time.sleep(wait)
