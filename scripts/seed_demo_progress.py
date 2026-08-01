@@ -6,7 +6,13 @@ be started from there.
 
     python -m scripts.seed_demo_progress --doc 4 --user 9 --user 11
     python -m scripts.seed_demo_progress --doc 4 --user 9 --user 11 --apply
+    python -m scripts.seed_demo_progress --doc 4 --user 9 --user 11 --apply --mastered
     python -m scripts.seed_demo_progress --doc 4 --user 9 --user 11 --clear --apply
+
+``--mastered`` marks the document COMPLETE on the learner's path instead of
+leaving it active. It also unlocks the next document, exactly as finishing a
+document for real does (see scoring._refresh_path_item) — otherwise the learner
+is left with a completed document and nothing to continue to.
 
 THESE ARE NOT REAL ASSESSMENTS. Every row this writes is tagged with
 ``SEED_MARKER`` in its summary and carries a transcript saying so, because the
@@ -63,6 +69,7 @@ def _clear(db, user_id: int, document_id: int) -> int:
 def main(argv: list[str]) -> int:
     apply = "--apply" in argv
     clear = "--clear" in argv
+    mastered = "--mastered" in argv
     doc_ids = [int(argv[i + 1]) for i, a in enumerate(argv) if a == "--doc" and i + 1 < len(argv)]
     user_ids = [int(argv[i + 1]) for i, a in enumerate(argv) if a == "--user" and i + 1 < len(argv)]
     if not doc_ids or not user_ids:
@@ -145,9 +152,10 @@ def main(argv: list[str]) -> int:
                 prog.status = "completed"
                 prog.updated_at = models.utcnow()
 
-            # Keep the document ACTIVE on the path. Marking it mastered would send
-            # the Continue-learning card to the next document, which is the
-            # opposite of "the upcoming session should be this one".
+            # --mastered  -> the document reads as COMPLETE on the path, and the
+            #                next one opens, mirroring a real completion.
+            # default     -> the document stays ACTIVE, so the Continue-learning
+            #                card keeps pointing at it.
             item = db.scalar(
                 select(models.LearningPathItem).where(
                     models.LearningPathItem.user_id == uid,
@@ -159,25 +167,53 @@ def main(argv: list[str]) -> int:
                     user_id=uid, document_id=document_id, idx=0, status="in_progress"
                 )
                 db.add(item)
-            else:
-                item.status = "in_progress"
-            # Anything else that was up_next would otherwise compete for the card.
-            for other in db.scalars(
-                select(models.LearningPathItem).where(
-                    models.LearningPathItem.user_id == uid,
-                    models.LearningPathItem.document_id != document_id,
-                    models.LearningPathItem.status == "up_next",
-                )
-            ).all():
-                other.status = "locked"
+                db.flush()
+            item.status = "mastered" if mastered else "in_progress"
             item.idx = 0
+
+            if mastered:
+                # Open the next document. Without this the learner has a completed
+                # document and nothing to continue to, because a previous seed run
+                # locked everything else so it would not compete for the card.
+                nxt = db.scalar(
+                    select(models.LearningPathItem)
+                    .where(
+                        models.LearningPathItem.user_id == uid,
+                        models.LearningPathItem.document_id != document_id,
+                        models.LearningPathItem.status == "locked",
+                    )
+                    .order_by(models.LearningPathItem.idx, models.LearningPathItem.document_id)
+                )
+                if nxt is not None:
+                    nxt.status = "up_next"
+            else:
+                # Anything else up_next would compete for the card.
+                for other in db.scalars(
+                    select(models.LearningPathItem).where(
+                        models.LearningPathItem.user_id == uid,
+                        models.LearningPathItem.document_id != document_id,
+                        models.LearningPathItem.status == "up_next",
+                    )
+                ).all():
+                    other.status = "locked"
             db.commit()
 
             u = scoring.document_understanding(db, uid, document_id)
             c = scoring.document_completion(db, uid, document_id)
+            nxt_doc = db.scalar(
+                select(models.LearningPathItem).where(
+                    models.LearningPathItem.user_id == uid,
+                    models.LearningPathItem.status.in_(["in_progress", "up_next"]),
+                ).order_by(models.LearningPathItem.idx)
+            )
+            nxt_name = ""
+            if nxt_doc is not None:
+                nd = db.get(models.Document, nxt_doc.document_id)
+                nxt_name = nd.name[:38] if nd else str(nxt_doc.document_id)
             print(
                 f"  {user.name}: {len(mods)} sections demonstrated — "
-                f"understanding {u}/100 ({scoring.band(u)}), completion {c}%"
+                f"understanding {u}/100 ({scoring.band(u)}), completion {c}%, "
+                f"path status '{item.status}', next up: {nxt_name or 'nothing'}"
             )
 
         return 0
