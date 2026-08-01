@@ -1,0 +1,24 @@
+# The Dockerfile does `COPY . .`, so anything not excluded here is baked into the
+# image. That is harmless for a GitHub deploy (the repo has no secrets) but NOT
+# for `railway up`, which uploads the working directory as-is — including .env.
+.env
+.env.*
+!.env.example
+
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Tests, docs and the unused upstream boilerplate are not needed at runtime.
+tests_lms
+docs
+backend
+cli
+*.db
+*.sqlite3
