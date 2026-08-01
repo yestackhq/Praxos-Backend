@@ -11,8 +11,9 @@ from pydantic import BaseModel
 from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
-from .. import memory, models, plan as plan_service, workspace
+from .. import llm, memory, models, plan as plan_service, workspace
 from ..db import get_db
+from ..auth import bearer_token
 from .cohorts import _admin, _draft_plans, _seed_path, _seed_progress, _valid_doc_ids, _valid_member_ids
 
 router = APIRouter(prefix="/api", tags=["teams"])
@@ -52,7 +53,12 @@ def _set_members(db: Session, team: models.Team, member_ids: list[int]) -> None:
 
 
 @router.post("/teams", status_code=status.HTTP_201_CREATED)
-def create_team(body: TeamIn, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> dict:
+def create_team(
+    body: TeamIn,
+    user: models.User = Depends(_admin),
+    token: Optional[str] = Depends(bearer_token),
+    db: Session = Depends(get_db),
+) -> dict:
     t = models.Team(
         workspace_id=user.workspace_id,
         name=(body.name or "").strip() or "Untitled team",
@@ -65,13 +71,19 @@ def create_team(body: TeamIn, user: models.User = Depends(_admin), db: Session =
     _set_documents(db, t, doc_ids)
     _set_members(db, t, _valid_member_ids(db, user.workspace_id, body.memberUserIds))
     db.commit()
-    _draft_plans(db, doc_ids)
+    _draft_plans(db, doc_ids, llm.EndUser.verified(token))
     db.refresh(t)
     return workspace.team_detail(db, t)
 
 
 @router.patch("/teams/{tid}")
-def edit_team(tid: int, body: TeamPatch, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> dict:
+def edit_team(
+    tid: int,
+    body: TeamPatch,
+    user: models.User = Depends(_admin),
+    token: Optional[str] = Depends(bearer_token),
+    db: Session = Depends(get_db),
+) -> dict:
     t = _get_team(db, tid, user.workspace_id)
     if body.name is not None and body.name.strip():
         t.name = body.name.strip()
@@ -84,7 +96,7 @@ def edit_team(tid: int, body: TeamPatch, user: models.User = Depends(_admin), db
     if body.memberUserIds is not None:
         _set_members(db, t, _valid_member_ids(db, user.workspace_id, body.memberUserIds))
     db.commit()
-    _draft_plans(db, new_docs)
+    _draft_plans(db, new_docs, llm.EndUser.verified(token))
     db.refresh(t)
     return workspace.team_detail(db, t)
 
@@ -99,7 +111,12 @@ def delete_team(tid: int, user: models.User = Depends(_admin), db: Session = Dep
 
 
 @router.post("/teams/{tid}/publish")
-def publish_team(tid: int, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> dict:
+def publish_team(
+    tid: int,
+    user: models.User = Depends(_admin),
+    token: Optional[str] = Depends(bearer_token),
+    db: Session = Depends(get_db),
+) -> dict:
     t = _get_team(db, tid, user.workspace_id)
     doc_ids = workspace._team_doc_ids(db, t.id)
     member_ids = workspace._team_member_ids(db, t.id)
@@ -108,7 +125,7 @@ def publish_team(tid: int, user: models.User = Depends(_admin), db: Session = De
             status.HTTP_400_BAD_REQUEST, "Add at least one document and one learner before publishing."
         )
     for did in doc_ids:
-        mods = plan_service.ensure_plan(db, did)
+        mods = plan_service.ensure_plan(db, did, end_user=llm.EndUser.verified(token))
         doc = db.get(models.Document, did)
         if doc is None:
             continue

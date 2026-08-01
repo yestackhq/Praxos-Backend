@@ -10,7 +10,7 @@ from typing import Optional
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from . import ai, models
+from . import ai, llm, models
 
 
 def get_modules(db: Session, document_id: int) -> list[models.Module]:
@@ -45,13 +45,17 @@ def section_chunks(doc: models.Document, mod: Optional[models.Module]) -> list[s
     return [c.content for c in doc.chunks]
 
 
-def ensure_plan(db: Session, document_id: int) -> list[models.Module]:
+def ensure_plan(
+    db: Session, document_id: int, *, end_user: Optional[llm.EndUser] = None
+) -> list[models.Module]:
     """Return the document's teaching plan, generating it the first time."""
     existing = get_modules(db, document_id)
-    return existing if existing else generate_plan(db, document_id)
+    return existing if existing else generate_plan(db, document_id, end_user=end_user)
 
 
-def generate_plan(db: Session, document_id: int) -> list[models.Module]:
+def generate_plan(
+    db: Session, document_id: int, *, end_user: Optional[llm.EndUser] = None
+) -> list[models.Module]:
     """(Re)generate a document's plan from its chunks, replacing any existing
     modules. Falls back to evenly-sized sections when no model is available, so
     the section structure always exists."""
@@ -59,7 +63,13 @@ def generate_plan(db: Session, document_id: int) -> list[models.Module]:
     if doc is None:
         return []
     chunks = [c.content for c in doc.chunks]
-    sections = ai.generate_lesson_plan(doc.name, chunks) if chunks else None
+    sections = (
+        ai.generate_lesson_plan(
+            doc.name, chunks, end_user=end_user, session_id=f"praxos-plan-d{document_id}"
+        )
+        if chunks
+        else None
+    )
     if not sections:
         sections = _fallback_sections(doc.name, len(chunks))
 

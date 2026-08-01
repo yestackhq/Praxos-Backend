@@ -99,7 +99,13 @@ def _as_int(value, fallback: int) -> int:
         return fallback
 
 
-def generate_lesson_plan(doc_name: str, chunks: list[str]) -> Optional[list[dict]]:
+def generate_lesson_plan(
+    doc_name: str,
+    chunks: list[str],
+    *,
+    end_user: Optional[llm.EndUser] = None,
+    session_id: Optional[str] = None,
+) -> Optional[list[dict]]:
     """Design a section-by-section teaching plan from a document's text.
 
     Returns an ordered list of sections — each a coherent unit a voice tutor
@@ -136,7 +142,9 @@ def generate_lesson_plan(doc_name: str, chunks: list[str]) -> Optional[list[dict
         '"topics": ["..."], "key_points": ["..."], "check_questions": ["..."], '
         '"minutes": <int>, "chunk_start": <int>, "chunk_end": <int>}]}'
     )
-    data = llm.chat_json(system, _plan_corpus(chunks), temperature=0.2)
+    data = llm.chat_json(
+        system, _plan_corpus(chunks), temperature=0.2, end_user=end_user, session_id=session_id
+    )
     if not data:
         return None
 
@@ -210,6 +218,8 @@ def score_understanding(
     *,
     section: Optional[dict] = None,
     prior_facts: Optional[list[str]] = None,
+    end_user: Optional[llm.EndUser] = None,
+    session_id: Optional[str] = None,
 ) -> Optional[dict]:
     """Grade one sitting into an understanding score (0-100) with evidence.
 
@@ -276,7 +286,7 @@ def score_understanding(
     )
     user = f"{_section_brief(section)}{prior_block}\n\n--- TRANSCRIPT ---\n{convo}"
 
-    data = llm.chat_json(system, user, temperature=0)
+    data = llm.chat_json(system, user, temperature=0, end_user=end_user, session_id=session_id)
     if not data:
         return None
     score = data.get("score")

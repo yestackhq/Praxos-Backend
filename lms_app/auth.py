@@ -71,6 +71,22 @@ def active_membership(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Account not ready, retry")
 
 
+async def bearer_token(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+) -> Optional[str]:
+    """The caller's RAW bearer credential, or None.
+
+    Used only to forward the signed-in person's own token to MeldOS as
+    ``X-End-User-Token`` so their model spend is attributed to them as verified.
+    ``lms_app/meldos.py`` refuses to attach it to any host other than the
+    configured MeldOS one, and never logs it. Do not use this for anything else —
+    identity comes from the verified claims, not from the raw string.
+    """
+    if not settings.auth_enabled or creds is None or not creds.credentials:
+        return None
+    return creds.credentials
+
+
 async def current_user(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
 ) -> dict:

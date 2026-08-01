@@ -31,6 +31,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from typing import Any, Optional
 
 import httpx
@@ -44,9 +45,44 @@ logger = logging.getLogger("praxos.agent")
 API_BASE = os.getenv("PRAXOS_API_BASE", "http://localhost:8000").rstrip("/")
 AGENT_SECRET = os.getenv("AGENT_SHARED_SECRET", "")
 
+# Model access. When MeldOS is configured the tutor's turn-by-turn reasoning —
+# by far the largest share of model spend — goes through the gateway, so it is
+# metered per application and per person like every other call.
+MELDOS_API_BASE_URL = (os.getenv("MELDOS_API_BASE_URL") or "").strip().rstrip("/")
+if MELDOS_API_BASE_URL and "://" not in MELDOS_API_BASE_URL:
+    MELDOS_API_BASE_URL = f"https://{MELDOS_API_BASE_URL}"
+MELDOS_APPLICATION_KEY = os.getenv("MELDOS_APPLICATION_KEY", "")
+MELDOS_MODEL = os.getenv("MELDOS_MODEL", "company-chat-model")
+MELDOS_ENABLED = bool(MELDOS_API_BASE_URL and MELDOS_APPLICATION_KEY)
+
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
+
+
+def _llm(learner_name: str, session_id: str = ""):
+    """The tutor's LLM, pointed at MeldOS when configured.
+
+    Attribution is CLAIMED (``X-End-User-Id``), by the learner's name: the worker
+    authenticates to the API with a service secret and never holds the learner's
+    own sign-in token, so it has nothing to make a verified claim with. The
+    header is only ever set on the MeldOS client — never on the direct-provider
+    fallback below.
+    """
+    if MELDOS_ENABLED:
+        # X-Session-ID is required by MeldOS; the LiveKit room is exactly the
+        # unit of work, so every turn of one lesson groups under one session.
+        headers = {"X-Session-ID": session_id or f"praxos-{uuid.uuid4()}"}
+        if learner_name:
+            headers["X-End-User-Id"] = learner_name
+        kwargs: dict[str, Any] = {"extra_headers": headers}
+        return openai.LLM(
+            model=MELDOS_MODEL,
+            api_key=MELDOS_APPLICATION_KEY,
+            base_url=f"{MELDOS_API_BASE_URL}/v1",
+            **kwargs,
+        )
+    return openai.LLM(model=LLM_MODEL, api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
 
 class SessionContext:
@@ -280,7 +316,7 @@ async def entrypoint(ctx: JobContext):
             # made empty sittings look like real answers and score 10.
             filler_words=False,
         ),
-        llm=openai.LLM(model=LLM_MODEL, api_key=LLM_API_KEY, base_url=LLM_BASE_URL),
+        llm=_llm(str(bootstrap.get("learnerName") or ""), session_id=room.name),
         tts=cartesia.TTS(
             model=tts_cfg.get("model", "sonic-2"),
             voice=tts_cfg.get("voice"),

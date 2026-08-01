@@ -60,7 +60,7 @@ def test_score_records_transcript_and_returns_document_standing(client, monkeypa
     monkeypatch.setattr(
         sessions.ai,
         "score_understanding",
-        lambda doc_name, transcript, section=None, prior_facts=None: {
+        lambda doc_name, transcript, **_kw: {
             "scoreable": True,
             "score": 80,
             "covered": 100,

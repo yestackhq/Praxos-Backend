@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import llm, poke
+from . import llm, meldos, poke
 from .config import settings
 from sqlalchemy import text
 
@@ -117,8 +117,13 @@ def health() -> dict:
         # What the deployment can actually do, so a misconfigured env is visible
         # from /api/health instead of surfacing as a dead voice button.
         "llm": {
-            "provider": settings.LLM_PROVIDER,
-            "model": settings.LLM_MODEL,
+            # When MeldOS is configured it fronts the model, so report THAT as the
+            # provider — otherwise health would name a vendor no request reaches.
+            # Only the base URL and model alias are reported; the application key
+            # is never included in any response.
+            "provider": "meldos" if settings.meldos_enabled else settings.LLM_PROVIDER,
+            "model": settings.MELDOS_MODEL if settings.meldos_enabled else settings.LLM_MODEL,
+            "gateway": meldos.base_url() or None,
             "enabled": llm.chat_enabled(),
             "note": poke.inference_unavailable_reason(),
         },

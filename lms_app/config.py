@@ -38,6 +38,20 @@ class Settings(BaseSettings):
     CLERK_ISSUER: Optional[str] = None
     CLERK_SECRET_KEY: Optional[str] = None
 
+    # ---- MeldOS gateway (see lms_app/meldos.py) ------------------------------
+    # When both are set, chat completions go through MeldOS instead of straight to
+    # a model vendor, so spend is metered per application and per person. The
+    # application key is a SECRET: server-side only, never in the client bundle,
+    # never committed (it belongs in .env, which is gitignored).
+    MELDOS_API_BASE_URL: Optional[str] = None
+    MELDOS_APPLICATION_KEY: Optional[str] = None
+    MELDOS_MODEL: str = "company-chat-model"
+    MELDOS_TIMEOUT: float = 60.0
+
+    @property
+    def meldos_enabled(self) -> bool:
+        return bool(self.MELDOS_API_BASE_URL and self.MELDOS_APPLICATION_KEY)
+
     # ---- AI provider (see lms_app/llm.py) ------------------------------------
     # The provider is a deployment choice, not a code constant. `openai_compatible`
     # covers any endpoint speaking /v1/chat/completions (Groq, Together, vLLM,
@@ -81,6 +95,8 @@ class Settings(BaseSettings):
     @property
     def openai_enabled(self) -> bool:
         """Back-compat alias: is text generation available at all?"""
+        if self.meldos_enabled:
+            return True
         return bool(self.llm_api_key) and self.LLM_PROVIDER.lower() not in ("none", "poke")
 
     # ---- Voice: LiveKit + Deepgram (STT) + Cartesia (TTS) --------------------
@@ -98,7 +114,7 @@ class Settings(BaseSettings):
     CARTESIA_API_KEY: Optional[str] = None
     CARTESIA_MODEL: str = "sonic-2"
     # Cartesia voice id for the tutor. Override per deployment.
-    CARTESIA_VOICE: str = "a0e99841-438c-4a64-b679-ae501e7d6091"
+    CARTESIA_VOICE: str = "638efaaa-4d0c-442e-b701-3fae16aad012"
 
     # Shared secret the agent worker presents on /api/sessions/agent/* — it is not
     # a learner and has no Clerk session. Unset => those routes are closed.

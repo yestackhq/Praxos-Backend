@@ -22,8 +22,8 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .. import ai, memory, models, plan as plan_service, poke, scoring, tutor, voice
-from ..auth import active_membership
+from .. import ai, llm, memory, meldos, models, plan as plan_service, poke, scoring, tutor, voice
+from ..auth import active_membership, bearer_token
 from ..config import settings
 from ..db import get_db
 
@@ -46,6 +46,23 @@ class ScoreIn(BaseModel):
     transcript: list[Turn] = []
     moduleIdx: Optional[int] = None
     paused: bool = False  # learner paused mid-section (resume later) vs finished it
+
+
+def _meldos_http_error(exc: meldos.MeldOSError) -> HTTPException:
+    """Map a MeldOS failure onto a response.
+
+    401/403 are the SERVER's credentials being wrong, not the learner's, so they
+    surface as 503 rather than being reflected back as an auth failure the
+    learner could act on. 429 is passed through with Retry-After so a client can
+    back off. Nothing here carries the application key or a user token — the
+    exception detail is built in meldos.py precisely so it cannot.
+    """
+    if exc.status == 429:
+        headers = {"Retry-After": exc.retry_after} if exc.retry_after else None
+        return HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=exc.detail, headers=headers
+        )
+    return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=exc.detail)
 
 
 def _doc_in_workspace(db: Session, document_id: int, ws_id: int) -> models.Document:
@@ -221,6 +238,7 @@ def _grade(
     doc: models.Document,
     module_idx: int,
     transcript: list[dict],
+    end_user: Optional[llm.EndUser] = None,
 ) -> Optional[dict]:
     """Run the assessor with the section's plan and source text as ground truth.
     Grading a transcript without them — which is what used to happen — leaves the
@@ -238,13 +256,23 @@ def _grade(
         document_id=doc.id,
         topic=(cur.title if cur else doc.name),
     )
-    return ai.score_understanding(doc.name, transcript, section=section, prior_facts=prior)
+    return ai.score_understanding(
+        doc.name,
+        transcript,
+        section=section,
+        prior_facts=prior,
+        end_user=end_user,
+        # One sitting = one MeldOS session, so a learner's grading calls for a
+        # section group together in the gateway's ledger.
+        session_id=f"praxos-u{user.id}-d{doc.id}-s{module_idx}",
+    )
 
 
 @router.post("/score")
 def score_session(
     body: ScoreIn,
     user: models.User = Depends(active_membership),
+    token: Optional[str] = Depends(bearer_token),
     db: Session = Depends(get_db),
 ) -> dict:
     doc = _doc_in_workspace(db, body.documentId, user.workspace_id)
@@ -263,7 +291,20 @@ def score_session(
     module_idx = body.moduleIdx if body.moduleIdx is not None else int(prog_idx or 0)
     module_idx = max(0, min(module_idx, max(0, total - 1)))
 
-    result = _grade(db, user=user, doc=doc, module_idx=module_idx, transcript=transcript)
+    # The learner is signed in and this is their own request, so forward their
+    # token for VERIFIED attribution. meldos.py refuses to attach it to anything
+    # other than the MeldOS host.
+    try:
+        result = _grade(
+            db,
+            user=user,
+            doc=doc,
+            module_idx=module_idx,
+            transcript=transcript,
+            end_user=llm.EndUser.verified(token),
+        )
+    except meldos.MeldOSError as exc:
+        raise _meldos_http_error(exc) from None
     if result is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -429,7 +470,19 @@ def agent_score(body: AgentScoreIn, db: Session = Depends(get_db)) -> dict:
 
     modules = plan_service.get_modules(db, doc.id)
     idx = max(0, min(body.moduleIdx, max(0, len(modules) - 1)))
-    result = _grade(db, user=user, doc=doc, module_idx=idx, transcript=transcript)
+    # The agent worker authenticates with a service secret and never holds the
+    # learner's token, so attribution here is CLAIMED, by name.
+    try:
+        result = _grade(
+            db,
+            user=user,
+            doc=doc,
+            module_idx=idx,
+            transcript=transcript,
+            end_user=llm.EndUser.claimed(user.name),
+        )
+    except meldos.MeldOSError as exc:
+        raise _meldos_http_error(exc) from None
     if result is None:
         return {"recorded": False, "reason": "no AI provider configured"}
     row = scoring.apply_session(

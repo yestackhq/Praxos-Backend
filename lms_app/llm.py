@@ -19,6 +19,12 @@ Configuration (all env / .env):
 contract — Together, Groq, Fireworks, vLLM, OpenRouter, LiteLLM, an in-house
 gateway. Point LLM_BASE_URL at it and set LLM_MODEL; no code changes.
 
+When MELDOS_API_BASE_URL + MELDOS_APPLICATION_KEY are set, chat completions are
+routed through the MeldOS gateway instead (``lms_app/meldos.py``) so spend is
+metered per application and per person. MeldOS takes precedence over LLM_* —
+it is a gateway in front of a provider, not a competing one. Embeddings are not
+part of the MeldOS contract and continue to use EMBED_*/LLM_*.
+
 ``poke`` is accepted so the provider name is selectable, but Poke's public API
 (POST /api/v1/inbound/api-message) is a ONE-WAY message intake: it answers
 ``{"success": true}`` and never returns model output. It therefore cannot serve
@@ -32,9 +38,14 @@ import re
 from functools import lru_cache
 from typing import Optional
 
+from . import meldos
 from .config import settings
 
 logger = logging.getLogger("praxos.llm")
+
+# Re-exported so callers name the end user without importing the gateway module.
+EndUser = meldos.EndUser
+MeldOSError = meldos.MeldOSError
 
 
 class LLMError(RuntimeError):
@@ -79,6 +90,8 @@ def _embed_client():
 
 
 def chat_enabled() -> bool:
+    if meldos.enabled():
+        return True
     try:
         return _chat_client() is not None
     except LLMError:
@@ -98,8 +111,23 @@ def chat_text(
     *,
     temperature: float = 0.2,
     max_tokens: Optional[int] = None,
+    end_user: Optional["meldos.EndUser"] = None,
+    session_id: Optional[str] = None,
 ) -> Optional[str]:
-    """A plain text completion. None when no provider is configured."""
+    """A plain text completion. None when no provider is configured.
+
+    ``end_user`` attributes the spend to a person when MeldOS is the provider;
+    it is ignored otherwise (and the token is never sent off-MeldOS — see
+    ``meldos.attribution_headers``)."""
+    if meldos.enabled():
+        body = meldos.chat_completion(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            end_user=end_user,
+            session_id=session_id,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return meldos.completion_text(body)
     client = _chat_client()
     if client is None:
         return None
@@ -119,6 +147,8 @@ def chat_json(
     *,
     temperature: float = 0.0,
     max_tokens: Optional[int] = None,
+    end_user: Optional["meldos.EndUser"] = None,
+    session_id: Optional[str] = None,
 ) -> Optional[dict]:
     """A JSON-object completion, parsed. None when no provider is configured or
     the reply could not be parsed as an object.
@@ -126,7 +156,38 @@ def chat_json(
     Uses response_format=json_object where supported and degrades to extracting
     the first ``{...}`` block, so an OpenAI-compatible endpoint that lacks JSON
     mode still works.
+
+    ``end_user`` attributes the spend to a person when MeldOS is the provider.
+    A MeldOS failure raises MeldOSError rather than returning None, so 401/403/
+    429/5xx reach the caller as distinct, actionable conditions instead of
+    collapsing into a generic "scoring unavailable".
     """
+    if meldos.enabled():
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        try:
+            body = meldos.chat_completion(
+                messages,
+                end_user=end_user,
+                session_id=session_id,
+                temperature=temperature,
+                response_format={"type": "json_object"},
+                max_tokens=max_tokens,
+            )
+        except meldos.MeldOSError as exc:
+            # A gateway that does not implement JSON mode is a shape problem, not
+            # an outage — retry once in plain mode before giving up.
+            if exc.status not in (400, 422):
+                raise
+            logger.info("meldos json mode unavailable (%s); retrying without it", exc.status)
+            body = meldos.chat_completion(
+                messages,
+                end_user=end_user,
+                session_id=session_id,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        return _parse_json_object(meldos.completion_text(body))
+
     client = _chat_client()
     if client is None:
         return None

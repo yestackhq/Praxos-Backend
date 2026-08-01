@@ -15,8 +15,8 @@ from pydantic import BaseModel
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from .. import memory, models, plan as plan_service, scoring, workspace
-from ..auth import active_membership
+from .. import llm, memory, meldos, models, plan as plan_service, scoring, workspace
+from ..auth import active_membership, bearer_token
 from ..db import get_db
 
 router = APIRouter(prefix="/api", tags=["cohorts"])
@@ -86,16 +86,21 @@ def _set_members(db: Session, cohort: models.Cohort, member_ids: list[int], ws_i
         db.add(models.CohortMember(cohort_id=cohort.id, user_id=uid))
 
 
-def _draft_plans(db: Session, doc_ids: list[int]) -> None:
+def _draft_plans(db: Session, doc_ids: list[int], end_user=None) -> None:
     for did in doc_ids:
         try:
-            plan_service.ensure_plan(db, did)
+            plan_service.ensure_plan(db, did, end_user=end_user)
         except Exception:  # plan generation is best-effort; never block cohort ops
             pass
 
 
 @router.post("/cohorts", status_code=status.HTTP_201_CREATED)
-def create_cohort(body: CohortIn, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> dict:
+def create_cohort(
+    body: CohortIn,
+    user: models.User = Depends(_admin),
+    token: Optional[str] = Depends(bearer_token),
+    db: Session = Depends(get_db),
+) -> dict:
     name = (body.name or "").strip() or "Untitled cohort"
     c = models.Cohort(workspace_id=user.workspace_id, name=name, published=False)
     db.add(c)
@@ -105,13 +110,19 @@ def create_cohort(body: CohortIn, user: models.User = Depends(_admin), db: Sessi
     _set_documents(db, c, doc_ids)
     _set_members(db, c, member_ids, user.workspace_id)
     db.commit()
-    _draft_plans(db, doc_ids)
+    _draft_plans(db, doc_ids, llm.EndUser.verified(token))
     db.refresh(c)
     return workspace.cohort_detail(db, c)
 
 
 @router.patch("/cohorts/{cid}")
-def edit_cohort(cid: int, body: CohortPatch, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> dict:
+def edit_cohort(
+    cid: int,
+    body: CohortPatch,
+    user: models.User = Depends(_admin),
+    token: Optional[str] = Depends(bearer_token),
+    db: Session = Depends(get_db),
+) -> dict:
     c = _get_cohort(db, cid, user.workspace_id)
     if body.name is not None and body.name.strip():
         c.name = body.name.strip()
@@ -123,7 +134,7 @@ def edit_cohort(cid: int, body: CohortPatch, user: models.User = Depends(_admin)
         member_ids = _valid_member_ids(db, user.workspace_id, body.memberUserIds)
         _set_members(db, c, member_ids, user.workspace_id)
     db.commit()
-    _draft_plans(db, new_docs)
+    _draft_plans(db, new_docs, llm.EndUser.verified(token))
     db.refresh(c)
     return workspace.cohort_detail(db, c)
 
@@ -139,7 +150,12 @@ def delete_cohort(cid: int, user: models.User = Depends(_admin), db: Session = D
 
 
 @router.post("/cohorts/{cid}/publish")
-def publish_cohort(cid: int, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> dict:
+def publish_cohort(
+    cid: int,
+    user: models.User = Depends(_admin),
+    token: Optional[str] = Depends(bearer_token),
+    db: Session = Depends(get_db),
+) -> dict:
     """Push each document's teaching plan + a learning-path seed into every
     member's memory, so the tutor opens already knowing what and how to teach."""
     c = _get_cohort(db, cid, user.workspace_id)
@@ -156,7 +172,7 @@ def publish_cohort(cid: int, user: models.User = Depends(_admin), db: Session = 
     # so completed learners aren't forced to redo everything.
     fresh = not c.published
     for did in doc_ids:
-        mods = plan_service.ensure_plan(db, did)
+        mods = plan_service.ensure_plan(db, did, end_user=llm.EndUser.verified(token))
         doc = db.get(models.Document, did)
         if doc is None:
             continue
@@ -294,9 +310,19 @@ def get_plan(did: int, user: models.User = Depends(_admin), db: Session = Depend
 
 
 @router.post("/documents/{did}/plan/generate")
-def regenerate_plan(did: int, user: models.User = Depends(_admin), db: Session = Depends(get_db)) -> dict:
+def regenerate_plan(
+    did: int,
+    user: models.User = Depends(_admin),
+    token: Optional[str] = Depends(bearer_token),
+    db: Session = Depends(get_db),
+) -> dict:
     doc = _own_doc(db, did, user.workspace_id)
-    mods = plan_service.generate_plan(db, did)
+    try:
+        mods = plan_service.generate_plan(db, did, end_user=llm.EndUser.verified(token))
+    except meldos.MeldOSError as exc:
+        from .sessions import _meldos_http_error
+
+        raise _meldos_http_error(exc) from None
     return {
         "document": {"id": doc.id, "name": doc.name},
         "modules": [_mod_out(m) for m in mods],
