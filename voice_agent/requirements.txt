@@ -1,0 +1,14 @@
+# Praxos voice agent worker (voice_agent/agent.py).
+#
+# Deployed as its own process/service, not with the API: it holds long-lived
+# LiveKit room connections and carries heavy audio deps (VAD model, codecs).
+#
+#     python -m voice_agent.agent dev     # local
+#     python -m voice_agent.agent start   # production
+#
+# Needs: LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, DEEPGRAM_API_KEY,
+#        CARTESIA_API_KEY, LLM_API_KEY (+ LLM_BASE_URL / LLM_MODEL),
+#        PRAXOS_API_BASE, AGENT_SHARED_SECRET.
+
+livekit-agents[deepgram,cartesia,openai,silero]>=1.0
+httpx>=0.27

@@ -487,4 +487,13 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="praxos-tutor"))
+    cli.run_app(
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            agent_name="praxos-tutor",
+            # The worker serves its own health endpoint at "/" on this port. Bind
+            # it to the platform's PORT so the deployment healthcheck has
+            # something to hit — a worker that dies otherwise looks healthy.
+            port=int(os.getenv("PORT", "8081")),
+        )
+    )
