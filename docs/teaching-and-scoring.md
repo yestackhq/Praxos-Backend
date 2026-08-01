@@ -44,11 +44,13 @@ The 46-chunk document's plan reads `[0,2) [3,8) [9,15) [16,19) [20,23) [24,29)
 at every boundary, and it stopped at 31 because it had never been shown chunks
 32–45. Roughly a third of that document was never taught to anyone.
 
-**Fixed by** `_plan_corpus` (shrinks the per-chunk excerpt to fit the budget so
-every chunk is always shown) and `_normalise_coverage` (keeps the model's
-ordering and re-derives boundaries so the plan tiles the document exactly once).
-`GET /api/documents/{id}/coverage` now reports coverage, and `tests_lms/test_plan.py`
-pins all four failure shapes above.
+**Fixed by** `_plan_corpus` (shrinks the per-chunk excerpt to fit the budget, so
+every chunk is always shown however long the document) and `_normalise_coverage`
+(keeps the model's ordering and re-derives the boundaries so the plan covers
+`[0, n)` with no gaps). Full coverage is enforced; overlap is allowed, because a
+plan with more sections than chunks should share a passage rather than lose a
+section. `GET /api/documents/{id}/coverage` reports coverage per document, and
+`tests_lms/test_plan.py` pins each failure shape above.
 
 ## 3. Teaching: the tutor had no bar to clear
 
