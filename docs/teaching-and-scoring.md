@@ -137,33 +137,40 @@ audited or re-graded. `sessions.transcript` now stores them, and
 `GET /api/people/{uid}/sessions/{sid}` returns the transcript with the
 per-key-point evidence behind the number.
 
-## 5. What the historical data can and cannot support
+## 5. What was done to the live data
 
-The migration reconstructs per-section history from the only surviving signal —
-the order of a learner's sittings on a document — because sessions recorded no
-section and `section_progress` held a single resume pointer per document. It
-also demotes the 45 no-answer sittings to unscoreable.
+Applied to `praxos_lms` (migration `e3a91c7b40d5`, full `pg_dump` taken first).
 
-**It cannot re-grade them.** Re-scoring against the new rubric needs the
-transcripts, and no transcript from those 128 sittings was ever persisted. Every
-number below is the *same* sitting scores, correctly attributed and rolled up —
-not a re-judgement of what the learner said.
+**Historical scores are retired, not re-graded.** Re-grading needs transcripts,
+and none of the 128 sittings stored one — the transcript went to the external
+memory service and nowhere else. Every historical score was also produced by a
+grader shown only a filename, which is why half of them are exactly 41 or 70 and
+23 more are the hard-coded 10. Rather than carry numbers nobody can reproduce,
+each sitting is kept as a record — with its section attributed from the order of
+that learner's sittings, the only surviving per-section signal — and `score`
+set to NULL. Nothing historical feeds an average; every learner reads as
+"Not started" until they sit a session under the new pipeline.
 
-| Learner | Old (last sitting) | New (document rollup) | Why it moved |
-|---|---|---|---|
-| Sachin Joseph | 10 | **31** | last sitting was a no-answer 10 |
-| Mohammed Adnan | 10 | **38** | same |
-| Rohith Menon | 10 | 11 | genuinely only did 2 of 6 sections |
-| Hisham | 70 | 52 | 70 was one section; 4 of 6 sections done |
-| Sanjay Mathew (ws4) | 70 | 44 | 70 was one section of one of three documents |
-| Rona sunil | 41 | 11 | 41 was a mid-document section; 2 of 6 done |
-| Sarath V P | 40 | 6 | one sitting on a six-section document |
+Path items previously marked `mastered` were re-opened (`up_next`): leaving them
+would assert a completion that nothing now evidences.
 
-The learners who were being penalised by the noise gate go up. The learners who
-looked fine on one section come down, because the old number was never a
-statement about the document. Cohort "Test Cohort - 2 - Engg vs Product" moves
-from an apparent mid-40s to **19 with 10% completion**, which is the accurate
-picture: most of its members have opened one or two sections of one document.
+**Plan coverage was repaired in place** (`scripts/repair_plan_coverage.py`).
+Five of the thirteen live documents had chunks in no section at all, including
+the 46-chunk one missing 21. The script re-derives section boundaries so the plan
+covers the whole document, keeping every section's title and order — no model
+required. All 13 documents now report full coverage. The splits it produces are
+mechanical (one section absorbed chunks 30–45), so regenerating those plans with
+`POST /api/documents/{id}/plan/generate` once an LLM key is configured will give
+a better division — and will also populate `key_points`/`check_questions`, which
+old plans do not have.
 
-Once real sittings run under the new pipeline, transcripts are stored and a
-re-grade becomes a replay over `sessions.transcript` — no manual scoring.
+**Not done, and why:** the existing plans have empty `key_points`, so until they
+are regenerated the grader falls back to judging against the section's source
+text and the tutor cannot enforce per-key-point checks. Regeneration needs a
+configured provider (`LLM_API_KEY`), which this environment did not have.
+
+## 6. Where re-grading becomes free
+
+Sittings now store `sessions.transcript` alongside the per-key-point evidence.
+The next time the rubric changes, a re-grade is a replay over stored transcripts
+rather than a manual exercise — which is the thing that was impossible here.

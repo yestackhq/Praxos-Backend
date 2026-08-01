@@ -27,15 +27,22 @@ What it adds
 
 Data migration
 --------------
-Existing sessions are mapped to documents by name within the learner's
-workspace, and their ``score`` is carried over. ``section_progress`` gains a
-best_score seeded from the previous ``score`` column.
+Sessions and path items are re-keyed from the document NAME to the document id,
+within the learner's workspace.
 
-Historical sessions carry no module_idx (it was never recorded) and no
-transcript (never stored), so they are attributed to section 0 and left with an
-empty transcript. They stay visible as history but, having no per-section
-evidence, they are NOT what the new document rollup is computed from — that
-comes from ``section_progress``, which this migration seeds.
+Historical scores are RETIRED, not carried over. Every pre-migration score was
+produced by a grader that was shown only the document's filename — no key
+points, no source text — which is why 52 of the 128 sittings scored exactly 41
+or 70, and why 23 more carry the hard-coded "the learner said nothing" value of
+10. None of those sittings stored a transcript, so they cannot be re-graded
+against the new rubric either. Keeping them would mean every learner's
+understanding was anchored to numbers nobody can justify or reproduce.
+
+So each historical sitting is preserved as a record — with its section
+attributed from the order of the learner's sittings on that document, the only
+surviving per-section signal — but with ``score = NULL``: measured, unmeasurable.
+No historical sitting contributes to any average. Learners start clean under the
+new pipeline, where transcripts ARE stored and a future re-grade is a replay.
 """
 
 from __future__ import annotations
@@ -63,36 +70,27 @@ def _is_pg() -> bool:
     return op.get_bind().dialect.name == "postgresql"
 
 
-def _reconstruct_section_history(conn) -> None:
-    """Attribute historical sittings to sections, and seed per-section bests.
+def _retire_historical_scores(conn) -> None:
+    """Attribute historical sittings to sections and retire their scores.
 
-    Sessions were written one-per-section-sitting but recorded no section, and
-    ``section_progress`` held a single resume pointer per document — so the only
-    surviving per-section signal is the ORDER of a learner's sittings on a
-    document. The old code advanced the pointer by one on every completed
-    sitting, so the n-th sitting is attributed to section ``min(n, last)``.
+    Section attribution: sessions recorded no ``module_idx`` and
+    ``section_progress`` held a single resume pointer per document, so the only
+    surviving signal is the ORDER of a learner's sittings on a document. The old
+    code advanced the pointer by one per completed sitting, so the n-th sitting
+    is attributed to section ``min(n, last)``. Approximate where a learner
+    restarted — good enough to read the history, and it feeds nothing numeric.
 
-    This is a reconstruction, not a recovery: where a learner restarted a
-    document the pointer was reset and the attribution will be off. It is
-    recorded so historical work is not thrown away, and it is strictly better
-    than the previous state, in which a learner's understanding was whatever
-    their most recent sitting scored.
-
-    Two classes of sitting are excluded from the bests, because they were never
-    measurements of understanding:
-      • score 10 with "1 exchanges"/"0 topics" — the literal hard-coded fallback
-        for "the learner said nothing" (23 rows in production);
-      • score 0 — the grader's floor for a transcript with no answer in it.
-    Both are now represented as an unscoreable sitting (score NULL).
+    Scores: set to NULL. See the module docstring for why they cannot be kept or
+    recomputed. ``section_progress`` is rebuilt as a plain per-document resume
+    pointer at section 0, and any path item marked "mastered" is re-opened —
+    leaving it mastered would assert a completion that nothing now evidences.
     """
     sessions = conn.execute(
         sa.text(
-            f"SELECT id, user_id, document_id, score, duration, topics "
-            f"FROM {_t('sessions')} ORDER BY user_id, document_id, id"
+            f"SELECT id, user_id, document_id FROM {_t('sessions')} "
+            "ORDER BY user_id, document_id, id"
         )
     ).mappings().all()
-    if not sessions:
-        return
 
     section_counts = {
         int(did): int(n)
@@ -101,60 +99,35 @@ def _reconstruct_section_history(conn) -> None:
         ).all()
     }
 
-    def _is_noise(row) -> bool:
-        if row["score"] is None or row["score"] <= 0:
-            return True
-        return (
-            row["score"] == 10
-            and (row["duration"] or "").startswith("1 exchange")
-            and (row["topics"] or "").startswith("0 ")
-        )
-
     ordinal: dict[tuple[int, int], int] = {}
-    bests: dict[tuple[int, int, int], int] = {}
     for row in sessions:
         key = (int(row["user_id"]), int(row["document_id"]))
         n = ordinal.get(key, 0)
         ordinal[key] = n + 1
         last = max(0, section_counts.get(key[1], 1) - 1)
-        idx = min(n, last)
         conn.execute(
             sa.text(f"UPDATE {_t('sessions')} SET module_idx = :i WHERE id = :sid"),
-            {"i": idx, "sid": row["id"]},
+            {"i": min(n, last), "sid": row["id"]},
         )
-        if _is_noise(row):
-            # An unscoreable sitting keeps its transcript-less record but stops
-            # counting as a measurement.
-            conn.execute(
-                sa.text(f"UPDATE {_t('sessions')} SET score = NULL WHERE id = :sid"),
-                {"sid": row["id"]},
-            )
-            continue
-        bkey = (key[0], key[1], idx)
-        bests[bkey] = max(bests.get(bkey, 0), int(row["score"]))
+    conn.execute(sa.text(f"UPDATE {_t('sessions')} SET score = NULL"))
 
-    # Replace the single resume-pointer row per document with one row per section.
+    # One resume pointer per (learner, document) they have touched, at section 0,
+    # with no score attached.
     conn.execute(sa.text(f"DELETE FROM {_t('section_progress')}"))
-    for (uid, did, idx), best in sorted(bests.items()):
-        conn.execute(
-            sa.text(
-                f"INSERT INTO {_t('section_progress')} "
-                "(user_id, document_id, module_idx, status, best_score, last_score, attempts, "
-                # the legacy varchar updated_at is still NOT NULL at this point;
-                # it is dropped a few statements later.
-                " updated_at, updated_at_ts) "
-                "VALUES (:u, :d, :i, :st, :b, :b, 1, '', "
-                + ("now()" if _is_pg() else "CURRENT_TIMESTAMP")
-                + ")"
-            ),
-            {
-                "u": uid,
-                "d": did,
-                "i": idx,
-                "st": "completed" if best >= 70 else "in_progress",
-                "b": best,
-            },
+    now_sql = "now()" if _is_pg() else "CURRENT_TIMESTAMP"
+    conn.execute(
+        sa.text(
+            f"INSERT INTO {_t('section_progress')} "
+            "(user_id, document_id, module_idx, status, attempts, updated_at, updated_at_ts) "
+            f"SELECT DISTINCT user_id, document_id, 0, 'in_progress', 0, '', {now_sql} "
+            f"FROM {_t('learning_path_items')}"
         )
+    )
+    conn.execute(
+        sa.text(
+            f"UPDATE {_t('learning_path_items')} SET status = 'up_next' WHERE status = 'mastered'"
+        )
+    )
 
 
 def upgrade() -> None:
@@ -276,10 +249,9 @@ def upgrade() -> None:
         b.add_column(sa.Column("attempts", sa.Integer(), nullable=False, server_default="0"))
         b.add_column(sa.Column("updated_at_ts", sa.DateTime(timezone=True), nullable=True))
 
-    # score must accept NULL before the reconstruction can mark the hard-coded
-    # "learner said nothing" sittings as unscoreable.
+    # score must accept NULL before historical scores can be retired.
     op.alter_column("sessions", "score", nullable=True, schema=SCHEMA)
-    _reconstruct_section_history(conn)
+    _retire_historical_scores(conn)
 
     # `topics` was the string "N topics"; the column becomes structured evidence.
     with op.batch_alter_table("sessions", schema=SCHEMA) as b:

@@ -14,14 +14,17 @@ anyone, because the planner prompt had been truncated before it saw them.
 from lms_app.ai import PLAN_MIN_EXCERPT, _normalise_coverage, _plan_corpus
 
 
-def _tiles(sections: list[dict], n: int) -> bool:
-    """Sections cover [0, n) exactly once, in order."""
-    cursor = 0
+def _covers(sections: list[dict], n: int) -> bool:
+    """Every chunk in [0, n) belongs to at least one section, in order, with no
+    gap. Overlap is permitted (see _normalise_coverage) — a skipped chunk is not."""
+    seen: set[int] = set()
+    prev_start = -1
     for s in sections:
-        if s["chunk_start"] != cursor or s["chunk_end"] <= s["chunk_start"]:
+        if s["chunk_end"] <= s["chunk_start"] or s["chunk_start"] < prev_start:
             return False
-        cursor = s["chunk_end"]
-    return cursor == n
+        prev_start = s["chunk_start"]
+        seen.update(range(s["chunk_start"], s["chunk_end"]))
+    return seen == set(range(n))
 
 
 def test_inclusive_end_indices_are_repaired():
@@ -36,7 +39,7 @@ def test_inclusive_end_indices_are_repaired():
         {"chunk_start": 16, "chunk_end": 18},  # leaves chunk 18 untaught
     ]
     out = _normalise_coverage([dict(s) for s in raw], 19)
-    assert _tiles(out, 19)
+    assert _covers(out, 19)
     assert out[-1]["chunk_end"] == 19
 
 
@@ -52,16 +55,17 @@ def test_a_plan_that_stops_early_is_extended_to_the_end():
         {"chunk_start": 30, "chunk_end": 31},
     ]
     out = _normalise_coverage([dict(s) for s in raw], 46)
-    assert _tiles(out, 46)
+    assert _covers(out, 46)
     assert out[-1]["chunk_end"] == 46
 
 
-def test_overlapping_sections_are_separated():
-    """MOP_Chapter_2: 5 sections over 4 chunks, with ranges that overlapped."""
-    raw = [{"chunk_start": i, "chunk_end": i + 2} for i in range(5)]
+def test_more_sections_than_chunks_share_rather_than_being_dropped():
+    """MOP_Chapter_4 has 6 planned sections over 4 chunks. Every section an admin
+    wrote must survive; neighbouring ones share a chunk."""
+    raw = [{"chunk_start": i, "chunk_end": i + 2} for i in range(6)]
     out = _normalise_coverage([dict(s) for s in raw], 4)
-    assert _tiles(out, 4)
-    assert len(out) == 4  # can't have more sections than chunks
+    assert _covers(out, 4)
+    assert len(out) == 6, "a section must never be silently dropped"
 
 
 def test_garbage_indices_still_yield_a_valid_plan():
@@ -71,7 +75,7 @@ def test_garbage_indices_still_yield_a_valid_plan():
         {"chunk_start": 1, "chunk_end": 1},
     ]
     out = _normalise_coverage([dict(s) for s in raw], 6)
-    assert _tiles(out, 6)
+    assert _covers(out, 6)
 
 
 def test_planner_sees_every_chunk_of_a_long_document():

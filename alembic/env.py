@@ -26,6 +26,12 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         render_as_batch=True,
+        # Keep the version pointer INSIDE the schema it describes. Without this
+        # alembic writes a single public.alembic_version, so two schemas in the
+        # same database (e.g. a staging clone) share one revision pointer and an
+        # upgrade against the second silently no-ops as "already at head".
+        version_table_schema=settings.db_schema,
+        include_schemas=True,
         dialect_opts={"paramstyle": "named"},
     )
     with context.begin_transaction():
@@ -43,6 +49,10 @@ def run_migrations_online() -> None:
             connection=connection,
             target_metadata=target_metadata,
             render_as_batch=True,  # safe ALTERs on SQLite
+            # See the note in run_migrations_offline: the version pointer must
+            # live in the schema being migrated, not in public.
+            version_table_schema=settings.db_schema,
+            include_schemas=True,
         )
         with context.begin_transaction():
             context.run_migrations()

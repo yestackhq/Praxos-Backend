@@ -43,14 +43,19 @@ def _plan_corpus(chunks: list[str]) -> str:
 
 
 def _normalise_coverage(sections: list[dict], n_chunks: int) -> list[dict]:
-    """Force the plan to tile the document exactly once: ordered, contiguous, no
-    gaps, no overlaps, ending at ``n_chunks``.
+    """Force the plan to cover the whole document: ordered, contiguous, no gaps,
+    ending at ``n_chunks``.
 
     Models routinely emit inclusive end indices, drift by one at each boundary,
     or stop early — which is how a 46-chunk document ended up with a plan that
     taught 25 chunks and never mentioned the last 14. Rather than trusting the
     ranges, we keep the model's ORDERING and section count and re-derive the
     boundaries from its proposed starts.
+
+    Full coverage is the hard requirement; non-overlap is not. When a plan has
+    more sections than the document has chunks, neighbouring sections share a
+    chunk instead of sections being dropped — several angles on the same passage
+    is a reasonable lesson, losing a section an admin wrote is not.
     """
     if not sections:
         return []
@@ -59,24 +64,31 @@ def _normalise_coverage(sections: list[dict], n_chunks: int) -> list[dict]:
             s["chunk_start"], s["chunk_end"] = 0, 0
         return sections
 
-    ordered = sorted(
-        sections, key=lambda s: _as_int(s.get("chunk_start"), 0)
-    ) if len(sections) > 1 else list(sections)
-    k = min(len(ordered), n_chunks)
-    ordered = ordered[:k]
+    ordered = (
+        sorted(sections, key=lambda s: _as_int(s.get("chunk_start"), 0))
+        if len(sections) > 1
+        else list(sections)
+    )
+    k = len(ordered)
+    crowded = k > n_chunks  # sections must share chunks
 
-    # Proposed starts, clamped and made strictly increasing.
     starts: list[int] = []
     for i, s in enumerate(ordered):
         want = _as_int(s.get("chunk_start"), i)
-        lo = 0 if i == 0 else starts[i - 1] + 1
-        hi = n_chunks - (k - i)  # leave at least one chunk for every later section
-        starts.append(max(lo, min(want, hi)))
-    starts[0] = 0
+        if i == 0:
+            starts.append(0)
+            continue
+        # Strictly increasing while there is room; otherwise merely non-decreasing.
+        lo = min(starts[i - 1] + (0 if crowded else 1), n_chunks - 1)
+        # Leave a chunk for each later section when we are not crowded.
+        hi = n_chunks - 1 if crowded else n_chunks - (k - i)
+        starts.append(max(lo, min(want, max(lo, hi))))
 
     for i, s in enumerate(ordered):
         s["chunk_start"] = starts[i]
-        s["chunk_end"] = starts[i + 1] if i + 1 < k else n_chunks
+        # End where the next section begins, so there is never a gap; at least
+        # one chunk wide; the final section always runs to the end.
+        s["chunk_end"] = n_chunks if i + 1 == k else max(starts[i] + 1, starts[i + 1])
     return ordered
 
 
