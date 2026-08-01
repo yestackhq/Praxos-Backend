@@ -296,3 +296,39 @@ def test_agent_context_reports_completion_instead_of_reserving_the_last_section(
         assert me["role"] == "Admin"
     finally:
         app.dependency_overrides.pop(optional_claims, None)
+
+
+def test_join_token_dispatches_the_named_agent(monkeypatch):
+    """The worker registers under an agent_name, which disables LiveKit's
+    automatic dispatch. Without an explicit dispatch request on the token the
+    learner joins a room no agent ever enters — they hear silence and nothing
+    logs an error."""
+    import base64
+    import json as _json
+
+    from lms_app import voice
+    from lms_app.config import settings
+
+    monkeypatch.setattr(settings, "LIVEKIT_URL", "wss://x.livekit.cloud", raising=False)
+    monkeypatch.setattr(settings, "LIVEKIT_API_KEY", "APItest", raising=False)
+    monkeypatch.setattr(settings, "LIVEKIT_API_SECRET", "s" * 40, raising=False)
+
+    jwt = voice.mint_join_token(
+        room="praxos-u9-d4-s0-abcd",
+        identity="learner-9",
+        name="Kiran Varma",
+        metadata=_json.dumps({"userId": 9, "documentId": 4}),
+    )
+    assert jwt
+
+    payload = jwt.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    claims = _json.loads(base64.urlsafe_b64decode(payload))
+
+    cfg = claims.get("roomConfig") or claims.get("room_config") or {}
+    agents = cfg.get("agents") or []
+    assert agents, f"token carries no agent dispatch: {claims}"
+    assert agents[0].get("agentName") == voice.AGENT_IDENTITY
+    # The dispatch carries the ids, so the worker can resolve the lesson before
+    # room/participant metadata has replicated.
+    assert '"documentId": 4' in agents[0].get("metadata", "")

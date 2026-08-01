@@ -71,6 +71,23 @@ def mint_join_token(
         .with_name(name)
         .with_grants(grants)
         .with_ttl(timedelta(minutes=ttl_minutes or settings.LIVEKIT_ROOM_TTL_MINUTES))
+        # Explicitly dispatch the tutor into this room.
+        #
+        # The worker registers under an agent_name, which turns OFF LiveKit's
+        # automatic dispatch — a named worker joins only rooms it is explicitly
+        # asked to. That is what we want: this LiveKit project hosts other
+        # products' agents too, and automatic dispatch would have our tutor join
+        # their rooms (and theirs join ours). The cost is that a room with no
+        # dispatch request gets no agent at all: the learner connects, hears
+        # silence, and nothing in the logs looks wrong.
+        #
+        # Carrying the request on the learner's own token means the dispatch
+        # happens exactly when they join, with no extra API call to fail.
+        .with_room_config(
+            api.RoomConfiguration(
+                agents=[api.RoomAgentDispatch(agent_name=AGENT_IDENTITY, metadata=metadata or "")]
+            )
+        )
     )
     if metadata:
         token = token.with_metadata(metadata)

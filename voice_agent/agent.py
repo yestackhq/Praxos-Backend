@@ -166,8 +166,11 @@ async def post_score(ctx: SessionContext, *, paused: bool) -> None:
             logger.warning("agent score post failed: %s", exc)
 
 
-def _room_meta(room: rtc.Room) -> dict:
-    for raw in (room.metadata or "", ):
+def _room_meta(room: rtc.Room, job_metadata: str = "") -> dict:
+    # Preferred source: the dispatch request that put this worker in the room.
+    # It is set by the API on the learner's token and arrives before the room or
+    # participant metadata has necessarily replicated.
+    for raw in (job_metadata, room.metadata or ""):
         if raw:
             try:
                 return json.loads(raw)
@@ -369,12 +372,13 @@ async def entrypoint(ctx: JobContext):
     room = ctx.room
 
     # The learner may still be joining — wait briefly for metadata to resolve.
-    meta = _room_meta(room)
+    job_meta = getattr(getattr(ctx, "job", None), "metadata", "") or ""
+    meta = _room_meta(room, job_meta)
     for _ in range(20):
         if meta:
             break
         await asyncio.sleep(0.25)
-        meta = _room_meta(room)
+        meta = _room_meta(room, job_meta)
 
     sctx = SessionContext(meta)
     if not sctx.valid:
