@@ -98,6 +98,14 @@ class SessionContext:
         self.transcript: list[dict] = []
         self.scored_upto: int = 0  # transcript index where the current section began
         self.posted: bool = False
+        # Serialises advances: two taps, or a tap arriving while the previous
+        # swap is still in flight, must not interleave and leave the worker
+        # teaching one section while the UI shows another.
+        self.advancing: asyncio.Lock = asyncio.Lock()
+        # True once the BROWSER has taken responsibility for grading everything
+        # up to `scored_upto`. The worker only grades what the browser did not,
+        # so a section is never scored twice (and never billed twice).
+        self.client_scored: bool = False
 
     @property
     def valid(self) -> bool:
@@ -183,6 +191,85 @@ async def _publish(room: rtc.Room, payload: dict) -> None:
         )
     except Exception as exc:
         logger.debug("publish_data failed: %s", exc)
+
+
+async def advance_section(
+    target: int,
+    *,
+    sctx: SessionContext,
+    session,
+    agent,
+    room,
+    fetch=None,
+    publish=None,
+) -> None:
+    """Move the live session onto section ``target``.
+
+    Ordering matters and is the whole fix. Previously this swapped
+    instructions and called generate_reply() without stopping the turn
+    already in progress: update_instructions only affects the NEXT inference,
+    so the tutor carried on speaking about the section the learner had just
+    left, and the new turn queued behind it. Whether that happened at all
+    depended on whether the tutor happened to be mid-sentence when the button
+    was tapped — which is exactly why it was intermittent.
+    """
+    async with sctx.advancing:
+        if target <= sctx.module_idx:
+            return  # stale or duplicate tap
+        if sctx.total_modules and target >= sctx.total_modules:
+            await (publish or _publish)(room, {"type": "course_complete", "moduleIdx": sctx.module_idx})
+            return
+
+        # 1. Stop the current turn FIRST, so nothing from the old section is
+        #    still being spoken over the new one.
+        try:
+            await session.interrupt()
+        except Exception as exc:
+            logger.debug("interrupt before advance failed: %s", exc)
+
+        # 2. The browser grades the section being left (it holds the
+        #    learner's token, so that call is attributed to them as
+        #    verified). Record that so the worker's safety net does not
+        #    grade the same turns a second time.
+        sctx.client_scored = True
+
+        previous_idx = sctx.module_idx
+        sctx.module_idx = target
+        nxt = await (fetch or fetch_context)(sctx, advancing=True)
+
+        if nxt is None or nxt.get("complete"):
+            # Roll back and TELL the browser. Returning silently left the UI
+            # waiting on a section change that would never arrive, with the
+            # button already hidden — stuck on the previous section with no
+            # way out.
+            sctx.module_idx = previous_idx
+            await (publish or _publish)(
+                room,
+                {
+                    "type": "course_complete" if (nxt or {}).get("complete") else "advance_failed",
+                    "moduleIdx": previous_idx,
+                },
+            )
+            return
+
+        sctx.module_idx = int(nxt.get("moduleIdx", target))
+        sctx.is_last = bool(nxt.get("isLast", True))
+        sctx.total_modules = int(nxt.get("totalModules") or sctx.total_modules)
+        sctx.scored_upto = len(sctx.transcript)
+        sctx.posted = False
+
+        await agent.update_instructions(nxt["instructions"])
+        await (publish or _publish)(
+            room,
+            {
+                "type": "section_changed",
+                "moduleIdx": sctx.module_idx,
+                "moduleTitle": nxt.get("moduleTitle"),
+                "isLast": sctx.is_last,
+            },
+        )
+        # 3. Only now speak, with the new section's instructions in place.
+        session.generate_reply()
 
 
 class TutorAgent(Agent):
@@ -360,35 +447,32 @@ async def entrypoint(ctx: JobContext):
             msg = json.loads(packet.data.decode())
         except Exception:
             return
-        if msg.get("type") != "advance":
-            return
-        # Grade the section we're leaving, then switch onto the next one in place.
-        await post_score(sctx, paused=False)
-        sctx.posted = False
-        sctx.module_idx = int(msg.get("moduleIdx", sctx.module_idx + 1))
-        nxt = await fetch_context(sctx, advancing=True)
-        if not nxt:
-            return
-        sctx.module_idx = int(nxt.get("moduleIdx", sctx.module_idx))
-        sctx.is_last = bool(nxt.get("isLast", True))
-        sctx.scored_upto = len(sctx.transcript)
-        await agent.update_instructions(nxt["instructions"])
-        await _publish(
-            room,
-            {
-                "type": "section_changed",
-                "moduleIdx": sctx.module_idx,
-                "moduleTitle": nxt.get("moduleTitle"),
-                "isLast": sctx.is_last,
-            },
-        )
-        session.generate_reply()
+        kind = msg.get("type")
+        if kind == "advance":
+            await advance_section(
+                int(msg.get("moduleIdx", sctx.module_idx + 1)),
+                sctx=sctx,
+                session=session,
+                agent=agent,
+                room=room,
+            )
+        elif kind == "ending":
+            # The browser is grading the final section itself and then leaving;
+            # the shutdown safety net must not grade it again.
+            sctx.client_scored = True
 
     @room.on("data_received")
     def _data(packet: rtc.DataPacket) -> None:
         asyncio.create_task(_on_data(packet))
 
     async def _flush(paused: bool = True) -> None:
+        """Grade the current section if — and only if — the browser did not.
+
+        Without this check the browser's score and the worker's safety net both
+        graded the same turns: two sittings recorded, and two billed model calls
+        for one conversation."""
+        if sctx.client_scored:
+            return
         await post_score(sctx, paused=paused)
 
     ctx.add_shutdown_callback(lambda: _flush(paused=True))

@@ -417,7 +417,13 @@ def agent_context(body: AgentContextIn, db: Session = Depends(get_db)) -> dict:
     if user is None or doc is None or doc.workspace_id != user.workspace_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown session")
     modules = plan_service.get_modules(db, doc.id)
-    idx = max(0, min(body.moduleIdx, max(0, len(modules) - 1)))
+    total = len(modules)
+    # Advancing PAST the last section must be reported, not clamped. Clamping
+    # silently returned the final section again, so the worker re-taught the
+    # section the learner had just finished and the UI looked stuck on it.
+    if total and body.moduleIdx >= total:
+        return {"complete": True, "moduleIdx": total - 1, "totalModules": total}
+    idx = max(0, min(body.moduleIdx, max(0, total - 1)))
     prog = db.scalar(
         select(models.SectionProgress).where(
             models.SectionProgress.user_id == user.id,
@@ -434,6 +440,7 @@ def agent_context(body: AgentContextIn, db: Session = Depends(get_db)) -> dict:
         advancing=body.advancing,
     )
     return {
+        "complete": False,
         "instructions": text,
         "learnerName": user.name,
         "document": {"id": doc.id, "name": doc.name},

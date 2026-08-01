@@ -233,10 +233,29 @@ def _parse_json_object(raw: Optional[str]) -> Optional[dict]:
 
 
 def embed_texts(texts: list[str]) -> Optional[list[list[float]]]:
+    """Embed a batch. None when embeddings are unavailable for ANY reason —
+    unconfigured, out of quota, rate limited, provider down.
+
+    Returning None rather than raising is deliberate: indexing treats it as "no
+    vectors" and stores the chunks anyway, so retrieval falls back to keyword
+    overlap and the document is still teachable. Raising here would fail the
+    whole upload, which would make a key with an exhausted balance strictly
+    worse than having no key at all.
+    """
     client = _embed_client()
     if client is None or not texts:
         return None
-    resp = client.embeddings.create(model=settings.embed_model, input=texts)
+    try:
+        resp = client.embeddings.create(model=settings.embed_model, input=texts)
+    except Exception as exc:
+        # Type and message only — never the key.
+        logger.warning(
+            "embeddings unavailable (%s); indexing without vectors, retrieval will "
+            "fall back to keyword overlap: %s",
+            type(exc).__name__,
+            str(exc)[:200],
+        )
+        return None
     return [d.embedding for d in resp.data]
 
 

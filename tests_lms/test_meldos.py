@@ -405,3 +405,24 @@ def test_health_reports_the_gateway_but_never_the_key(client, meldos_on):
     assert body["llm"]["provider"] == "meldos"
     assert body["llm"]["model"] == MODEL_ALIAS
     assert FAKE_KEY not in json.dumps(body)
+
+
+# ---- embeddings degrade rather than failing an upload ------------------------
+
+
+def test_embedding_failure_does_not_break_indexing(monkeypatch, caplog):
+    """A key with an exhausted balance (429 insufficient_quota) must leave the
+    document indexed WITHOUT vectors, not fail the upload. Raising here would
+    make a bad key worse than no key."""
+
+    class Boom:
+        class embeddings:
+            @staticmethod
+            def create(**_kw):
+                raise RuntimeError("You have no credits remaining. sk-proj-SECRETKEY")
+
+    monkeypatch.setattr(llm, "_embed_client", lambda: Boom())
+    with caplog.at_level(logging.WARNING):
+        assert llm.embed_texts(["chunk one", "chunk two"]) is None
+        assert llm.embed_one("chunk") is None
+    assert "keyword overlap" in caplog.text
