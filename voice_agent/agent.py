@@ -406,6 +406,12 @@ async def entrypoint(ctx: JobContext):
             # Do not transcribe silence into "Thank you." — the artifact that
             # made empty sittings look like real answers and score 10.
             filler_words=False,
+            # Deepgram finalises a segment after this much silence. The default
+            # of 25ms splits ordinary speech mid-sentence: a learner saying
+            # "...talking about. Doesn't make sense." was recorded as two turns,
+            # "Doesn't" and "sense." That inflates the answer count and hands the
+            # grader broken fragments instead of what the learner actually said.
+            endpointing_ms=400,
         ),
         llm=_llm(str(bootstrap.get("learnerName") or ""), session_id=room.name),
         tts=cartesia.TTS(
