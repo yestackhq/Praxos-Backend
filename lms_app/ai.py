@@ -29,6 +29,10 @@ embed_one = llm.embed_one
 # silently leave the tail of the document untaught — the excerpt size shrinks to
 # fit rather than the chunk list being truncated.
 PLAN_TOTAL_BUDGET = 90_000
+# Planning sends the WHOLE document and asks for structured output over it, so it
+# runs far longer than a scoring call. It gets its own budget rather than
+# inheriting the general request timeout.
+PLAN_TIMEOUT_SECONDS = 300.0
 PLAN_MIN_EXCERPT = 220
 PLAN_MAX_EXCERPT = 900
 
@@ -143,7 +147,12 @@ def generate_lesson_plan(
         '"minutes": <int>, "chunk_start": <int>, "chunk_end": <int>}]}'
     )
     data = llm.chat_json(
-        system, _plan_corpus(chunks), temperature=0.2, end_user=end_user, session_id=session_id
+        system,
+        _plan_corpus(chunks),
+        temperature=0.2,
+        end_user=end_user,
+        session_id=session_id,
+        timeout=PLAN_TIMEOUT_SECONDS,
     )
     if not data:
         return None

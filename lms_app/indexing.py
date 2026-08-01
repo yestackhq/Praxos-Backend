@@ -22,6 +22,53 @@ CHUNK_CHARS = 1200
 CHUNK_OVERLAP = 150
 
 
+def _is_letter_spaced(line: str) -> bool:
+    """True when a line is mostly single characters, i.e. the extractor emitted a
+    space between every glyph."""
+    tokens = line.split()
+    if len(tokens) < 3:
+        return False
+    singles = sum(1 for t in tokens if len(t) == 1)
+    return singles / len(tokens) > 0.6
+
+
+def repair_letter_spacing(text: str) -> str:
+    """Undo per-glyph spacing from PDFs that position each character separately.
+
+    Such a PDF extracts as::
+
+        E n g i n e e r i n g 's  o b j e c t  i s  t h e
+
+    — letters separated by ONE space, words by TWO. That distinction is the only
+    record of where words begin, and it must be used before any whitespace
+    normalisation: collapsing runs of spaces first (which ``chunk_text`` does)
+    destroys it irrecoverably, turning the page into one unreadable string.
+
+    That is what happened to a live document: 18 of its 19 chunks were stored as
+    letter salad, so the tutor taught from it and the grader marked answers
+    against it. Lines that are not letter-spaced are returned untouched.
+    """
+    out: list[str] = []
+    for line in text.split("\n"):
+        if not _is_letter_spaced(line):
+            out.append(line)
+            continue
+        stripped = line.strip()
+        if "  " in stripped:
+            # Double spaces mark the word boundaries — use them.
+            words = [w.replace(" ", "") for w in re.split(r" {2,}", stripped)]
+            out.append(" ".join(w for w in words if w))
+        else:
+            # A short fragment with no double space carries no boundary
+            # information ("s p e c ."), so it is a single word. Note the
+            # trade-off: a genuine run of initials ("A B C") joins to "ABC".
+            # In this corpus that is far rarer, and far less damaging, than
+            # leaving a fragment as letter salad in the text the tutor teaches
+            # from and the grader marks against.
+            out.append(stripped.replace(" ", ""))
+    return "\n".join(out)
+
+
 def extract_text(data: bytes) -> str:
     """Pull text out of a PDF byte stream. Returns "" if it can't be read."""
     try:
@@ -29,7 +76,9 @@ def extract_text(data: bytes) -> str:
 
         reader = PdfReader(io.BytesIO(data))
         pages = [(page.extract_text() or "") for page in reader.pages]
-        return "\n\n".join(pages).strip()
+        # Repair BEFORE joining/normalising — the word boundaries only exist as
+        # double spaces at this point.
+        return repair_letter_spacing("\n\n".join(pages)).strip()
     except Exception:
         return ""
 
@@ -119,7 +168,15 @@ def retrieve(db: Session, document_id: int, query: str, k: int = 4) -> list[str]
     if not rows:
         return []
     qvec = ai.embed_one(query)
-    if qvec and all(r.embedding for r in rows):
+    # Every stored vector must come from the SAME model as the query vector, or
+    # the comparison is meaningless. Width is the observable proxy: _cosine zips
+    # its inputs, so a 1536-dim leftover scored against a 2048-dim query would
+    # silently rank on the first 1536 components instead of failing. Falling back
+    # to keyword overlap is the honest answer until the chunks are re-embedded.
+    usable = bool(qvec) and all(
+        r.embedding is not None and len(r.embedding) == len(qvec) for r in rows
+    )
+    if usable:
         ranked = sorted(rows, key=lambda r: _cosine(qvec, r.embedding), reverse=True)
     else:
         ranked = sorted(rows, key=lambda r: _keyword_score(query, r.content), reverse=True)

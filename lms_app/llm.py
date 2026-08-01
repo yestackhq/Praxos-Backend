@@ -149,6 +149,7 @@ def chat_json(
     max_tokens: Optional[int] = None,
     end_user: Optional["meldos.EndUser"] = None,
     session_id: Optional[str] = None,
+    timeout: Optional[float] = None,
 ) -> Optional[dict]:
     """A JSON-object completion, parsed. None when no provider is configured or
     the reply could not be parsed as an object.
@@ -172,6 +173,7 @@ def chat_json(
                 temperature=temperature,
                 response_format={"type": "json_object"},
                 max_tokens=max_tokens,
+                timeout=timeout,
             )
         except meldos.MeldOSError as exc:
             # A gateway that does not implement JSON mode is a shape problem, not
@@ -185,6 +187,7 @@ def chat_json(
                 session_id=session_id,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                timeout=timeout,
             )
         return _parse_json_object(meldos.completion_text(body))
 
@@ -246,7 +249,15 @@ def embed_texts(texts: list[str]) -> Optional[list[list[float]]]:
     if client is None or not texts:
         return None
     try:
-        resp = client.embeddings.create(model=settings.embed_model, input=texts)
+        resp = client.embeddings.create(
+            model=settings.embed_model,
+            input=texts,
+            # The SDK defaults to base64 for wire efficiency, which several
+            # providers reject outright (NVIDIA's embedders among them). "float"
+            # is the spec default and is accepted everywhere; the size
+            # difference is immaterial at this volume.
+            encoding_format="float",
+        )
     except Exception as exc:
         # Type and message only — never the key.
         logger.warning(

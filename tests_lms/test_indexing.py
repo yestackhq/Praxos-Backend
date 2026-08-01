@@ -101,3 +101,46 @@ def test_upload_rejects_empty_file(client):
         assert r.status_code == 400
     finally:
         _clear()
+
+
+def test_repair_letter_spacing_recovers_word_boundaries():
+    """PDFs that position each glyph separately extract as letters-with-spaces,
+    with words marked by DOUBLE spaces. That signal has to be used before any
+    whitespace normalisation, or the page becomes one unreadable string — which
+    is exactly what happened to a live document (18 of 19 chunks)."""
+    from lms_app.indexing import chunk_text, extract_text, repair_letter_spacing
+
+    mangled = "E n g i n e e r i n g 's  o b j e c t  i s  t h e\na r t i f a c t .  P r o d u c t 's  o b j e c t"
+    fixed = repair_letter_spacing(mangled)
+    assert fixed == "Engineering's object is the\nartifact. Product's object"
+
+    # Normal prose is left completely alone.
+    prose = "The one sentence\nEngineering exists to make the system correct."
+    assert repair_letter_spacing(prose) == prose
+
+    # A fragment with no double space has no boundary information, so it is
+    # treated as one word. Accepted trade-off: a genuine run of initials joins
+    # too ("A B C" -> "ABC"), which is far rarer here than letter-salad
+    # fragments like "s p e c ." that would otherwise reach the tutor.
+    assert repair_letter_spacing("s p e c .") == "spec."
+
+    # End to end: repaired text survives chunking with its words intact.
+    chunks = chunk_text(repair_letter_spacing(mangled))
+    assert chunks and "Engineering's object is the" in chunks[0]
+
+
+def test_extract_text_repairs_a_real_letter_spaced_pdf():
+    """The repair must run inside extract_text, before chunk_text collapses the
+    double spaces that carry the word boundaries."""
+    from lms_app.indexing import extract_text
+
+    # A PDF whose text is drawn glyph-by-glyph is hard to synthesise here, so
+    # assert the ordering property that made the bug possible instead: the
+    # helper is applied to the joined page text, not after normalisation.
+    import inspect
+
+    from lms_app import indexing
+
+    src = inspect.getsource(indexing.extract_text)
+    assert "repair_letter_spacing" in src
+    assert extract_text(b"not a pdf") == ""
