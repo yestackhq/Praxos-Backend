@@ -52,8 +52,14 @@ ADVANCE_TOOL = {
                 "description": "Which of this section's key points the learner demonstrated.",
             },
             "confidence": {
-                "type": "integer",
-                "description": "0-100: how confident you are they genuinely understand it.",
+                # number, not integer: models answer 0.95 as readily as 95, and a
+                # strict integer type made the whole tool call fail validation.
+                # The worker accepts either and normalises.
+                "type": "number",
+                "description": (
+                    "How confident you are that they genuinely understand it. "
+                    "Either 0-100 or 0-1; both are accepted."
+                ),
             },
         },
         "required": ["learner_explanation", "key_points_covered", "confidence"],

@@ -33,6 +33,11 @@ PLAN_TOTAL_BUDGET = 90_000
 # runs far longer than a scoring call. It gets its own budget rather than
 # inheriting the general request timeout.
 PLAN_TIMEOUT_SECONDS = 300.0
+
+# Grading sends the section's key points, its source text and the whole
+# transcript, then reasons over them. Against the 60s default request budget it
+# timed out and the learner's finished session was lost with a 503.
+SCORE_TIMEOUT_SECONDS = 240.0
 PLAN_MIN_EXCERPT = 220
 PLAN_MAX_EXCERPT = 900
 
@@ -295,7 +300,14 @@ def score_understanding(
     )
     user = f"{_section_brief(section)}{prior_block}\n\n--- TRANSCRIPT ---\n{convo}"
 
-    data = llm.chat_json(system, user, temperature=0, end_user=end_user, session_id=session_id)
+    data = llm.chat_json(
+        system,
+        user,
+        temperature=0,
+        end_user=end_user,
+        session_id=session_id,
+        timeout=SCORE_TIMEOUT_SECONDS,
+    )
     if not data:
         return None
     score = data.get("score")

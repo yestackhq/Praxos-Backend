@@ -332,3 +332,27 @@ def test_join_token_dispatches_the_named_agent(monkeypatch):
     # The dispatch carries the ids, so the worker can resolve the lesson before
     # room/participant metadata has replicated.
     assert '"documentId": 4' in agents[0].get("metadata", "")
+
+
+def test_confidence_accepts_the_scale_the_model_actually_uses():
+    """A live session failed here. The tool declared `confidence: int` for a 0-100
+    value; the model sent 0.95 — the natural reading of "confidence" — pydantic
+    rejected the call, and the learner never got a Next-section button while the
+    tutor told them to move on. Both scales must work."""
+    import inspect
+
+    from voice_agent.agent import TutorAgent
+
+    fn = TutorAgent.mark_section_understood
+    raw = getattr(fn, "__wrapped__", None) or getattr(fn, "func", None) or fn
+    sig = inspect.signature(raw)
+    assert sig.parameters["confidence"].annotation in (float, "float"), (
+        "confidence must be a float; an int type rejects 0.95 outright"
+    )
+
+
+def test_advance_tool_schema_advertises_a_number():
+    from lms_app.tutor import ADVANCE_TOOL
+
+    prop = ADVANCE_TOOL["parameters"]["properties"]["confidence"]
+    assert prop["type"] == "number", "integer makes a 0-1 confidence fail validation"

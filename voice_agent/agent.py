@@ -338,12 +338,20 @@ class TutorAgent(Agent):
         self,
         learner_explanation: str,
         key_points_covered: list[str],
-        confidence: int,
+        confidence: float,
     ) -> str:
         """Reveal the learner's 'Next section' button."""
+        # Typed float, not int. The parameter was documented as 0-100 but typed
+        # int, and the model answered 0.95 — the natural reading of "confidence".
+        # Pydantic rejected the call, so the tool never ran, section_ready was
+        # never published, and the learner sat looking at "End session" while the
+        # tutor told them to move on. Accept both conventions.
+        score = float(confidence)
+        if score <= 1.0:
+            score *= 100.0
         # The gate: a model that cannot produce the learner's own words has not
         # heard an explanation. This is what stops "yeah, got it" from passing.
-        if len(learner_explanation.split()) < 6 or confidence < 60:
+        if len(learner_explanation.split()) < 6 or score < 60:
             return (
                 "Not enough evidence to advance. Ask the learner to explain the idea in their "
                 "own words, then probe with a fresh example before calling this again."
@@ -357,7 +365,7 @@ class TutorAgent(Agent):
                 "evidence": {
                     "explanation": learner_explanation,
                     "keyPoints": key_points_covered,
-                    "confidence": confidence,
+                    "confidence": round(score),
                 },
             },
         )

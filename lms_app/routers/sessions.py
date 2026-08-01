@@ -14,6 +14,7 @@ The agent worker authenticates with the shared ``AGENT_SHARED_SECRET`` on the
 ``/agent/*`` routes; learners authenticate with their Clerk session as usual.
 """
 
+import logging
 import secrets
 from typing import Optional
 
@@ -26,6 +27,8 @@ from .. import ai, llm, memory, meldos, models, plan as plan_service, poke, scor
 from ..auth import active_membership, bearer_token
 from ..config import settings
 from ..db import get_db
+
+logger = logging.getLogger("praxos.sessions")
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
@@ -294,6 +297,7 @@ def score_session(
     # The learner is signed in and this is their own request, so forward their
     # token for VERIFIED attribution. meldos.py refuses to attach it to anything
     # other than the MeldOS host.
+    graded = True
     try:
         result = _grade(
             db,
@@ -304,7 +308,22 @@ def score_session(
             end_user=llm.EndUser.verified(token),
         )
     except meldos.MeldOSError as exc:
-        raise _meldos_http_error(exc) from None
+        # Do NOT throw the conversation away. Returning an error here meant a
+        # grader timeout destroyed a finished session outright: the learner spoke
+        # for ten minutes and nothing was recorded, with no way to recover it.
+        # The transcript is the valuable part — store it unscored so the sitting
+        # can be re-graded (scripts/regrade.py) once the provider recovers.
+        logger.warning("grading failed (MeldOS %s); recording the sitting unscored", exc.status)
+        graded = False
+        result = {
+            "scoreable": False,
+            "score": None,
+            "covered": 0,
+            "summary": "Not graded yet — the assessor was unavailable. This session is saved and will be re-graded.",
+            "topics": [],
+            "strengths": [],
+            "gaps": [],
+        }
     if result is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -348,6 +367,10 @@ def score_session(
         # This sitting.
         "score": session_row.score,
         "scoreable": session_row.score is not None,
+        # False = we could not reach the assessor, NOT "you said nothing".
+        # The UI must not tell a learner who spoke at length that there was
+        # nothing to assess.
+        "graded": graded,
         "summary": result.get("summary", ""),
         "topics": result.get("topics", []),
         "strengths": result.get("strengths", []),

@@ -323,7 +323,7 @@ def test_scoring_request_attributes_to_the_signed_in_learner(client, monkeypatch
         _clear()
 
 
-def test_rate_limit_reaches_the_client_as_429_without_secrets(client, monkeypatch, meldos_on):
+def test_a_grader_outage_preserves_the_conversation(client, monkeypatch, meldos_on):
     from lms_app.auth import bearer_token
     from lms_app.main import app
     from tests_lms.test_indexing import _minimal_pdf
@@ -344,26 +344,34 @@ def test_rate_limit_reaches_the_client_as_429_without_secrets(client, monkeypatc
         ).json()
 
         _respond(monkeypatch, 429, headers={"Retry-After": "30"})
+        turns = [{"role": "learner", "text": "You report an incident within twenty four hours."}]
         resp = client.post(
-            "/api/sessions/score",
-            json={
-                "documentId": doc["id"],
-                "transcript": [
-                    {"role": "learner", "text": "You report an incident within twenty four hours."}
-                ],
-            },
+            "/api/sessions/score", json={"documentId": doc["id"], "transcript": turns}
         )
-        assert resp.status_code == 429
-        assert resp.headers.get("Retry-After") == "30"
+        # A grader outage must NOT destroy a finished session. Erroring here meant
+        # a learner spoke for ten minutes and nothing was recorded at all.
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["graded"] is False, "must be distinguishable from 'you said nothing'"
+        assert body["score"] is None
         assert FAKE_KEY not in resp.text
         assert FAKE_TOKEN not in resp.text
+
+        # The transcript is the valuable part and must survive for a re-grade.
+        from lms_app import models
+        from lms_app.db import SessionLocal
+
+        with SessionLocal() as db:
+            row = db.query(models.LearningSession).order_by(models.LearningSession.id.desc()).first()
+            assert row.transcript == turns
+            assert row.score is None
     finally:
         _clear()
 
 
 def test_rejected_key_does_not_leak_through_the_api(client, monkeypatch, meldos_on):
-    """A 401 from MeldOS is a server misconfiguration, so the learner gets a 503 —
-    and the response never contains the key that was rejected."""
+    """A 401 is a server misconfiguration — the learner should not lose their
+    session over it either, and the response must never contain the key."""
     from lms_app.auth import bearer_token
     from lms_app.main import app
     from tests_lms.test_indexing import _minimal_pdf
@@ -393,11 +401,25 @@ def test_rejected_key_does_not_leak_through_the_api(client, monkeypatch, meldos_
                 ],
             },
         )
-        assert resp.status_code == 503
+        assert resp.status_code == 200
+        assert resp.json()["graded"] is False
         assert FAKE_KEY not in resp.text
         assert FAKE_TOKEN not in resp.text
     finally:
         _clear()
+
+
+def test_an_admin_action_still_surfaces_a_rate_limit(meldos_on):
+    """Swallowing a failure is right for a finished conversation, which cannot be
+    replayed. It is wrong for an admin action they can simply retry — those still
+    get the real status back."""
+    from lms_app.meldos import MeldOSError
+    from lms_app.routers.sessions import _meldos_http_error
+
+    exc = _meldos_http_error(MeldOSError(429, "rate limited", retry_after="30"))
+    assert exc.status_code == 429
+    assert exc.headers.get("Retry-After") == "30"
+    assert FAKE_KEY not in str(exc.detail)
 
 
 def test_health_reports_the_gateway_but_never_the_key(client, meldos_on):
