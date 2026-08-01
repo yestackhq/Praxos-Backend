@@ -17,5 +17,9 @@ RUN pip install --no-cache-dir -r requirements.txt "psycopg[binary]>=3.1"
 COPY . .
 
 ENV PORT=8000
-# lms_app's lifespan creates tables + seeds on startup (SEED_ON_STARTUP).
-CMD ["sh", "-c", "uvicorn lms_app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Bind :: (dual-stack), NOT 0.0.0.0. Railway's private network is IPv6-only, so
+# an IPv4-only listener is unreachable at <service>.railway.internal — the
+# service would only work through its public URL, which is exactly what we are
+# removing. On Linux :: accepts IPv4-mapped connections too, so the public edge
+# keeps working unchanged.
+CMD ["sh", "-c", "uvicorn lms_app.main:app --host :: --port ${PORT:-8000}"]
