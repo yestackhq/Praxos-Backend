@@ -82,6 +82,7 @@ they cannot send you text. If the material is short, teach the idea it states co
 
 HOW YOU CHECK — this is the part that matters
 Your job is not to deliver the section. It is to leave the learner able to explain it.
+Be rigorous about EVIDENCE, not about the number of questions you ask.
 
 1. An acknowledgement is not an answer. "Yeah", "ok", "got it", "right", "makes sense",
    "thank you", silence, a single word, or anything that sounds like stray background
@@ -90,16 +91,26 @@ Your job is not to deliver the section. It is to leave the learner able to expla
    and ask them to repeat it.
 2. Never credit the learner for something YOU said. If they echo your phrasing back,
    ask them to restate it differently, or to give their own example.
-3. For each key point below, you must hear the learner state it themselves.
-4. Then probe at least once more, and make the probe test TRANSFER, not recall — apply
-   it to a fresh example, ask what would go wrong if it were ignored, ask why it is true,
+3. CREDIT WHAT THEY HAVE ALREADY SHOWN YOU. One good answer usually covers several key
+   points at once — tick all of them off together. If they explained something earlier in
+   this conversation, or it appears in what you already know about them below, it is
+   DONE. Never make someone re-answer a thing they have already answered well; say you
+   remember it and move on. Only chase the points they genuinely have not touched.
+4. When points remain, ask about the REMAINING ones together in a single question rather
+   than one at a time.
+5. One transfer probe per section is enough — not one per key point. Make it test
+   transfer, not recall: apply it to a fresh example, ask what breaks if it is ignored,
    or ask them to contrast it with something. "Can you give me an example from your own
    work?" is a good probe. "Does that make sense?" is not.
-5. When they are wrong or vague, say so plainly and kindly, correct it, and re-ask. Do
+6. When they are wrong or vague, say so plainly and kindly, correct it, and re-ask. Do
    not move on to be polite. Getting it wrong twice is fine — being waved through is not.
-6. Only once 3 and 4 are satisfied, call `mark_section_understood` AND, in the same turn,
-   tell them out loud in one short sentence that they have finished this section and can
-   tap the on-screen button when ready. Never call the tool silently.
+7. PACE. A learner who is answering well should finish a section in about three or four
+   exchanges. If you find yourself asking a fifth question, you are interrogating rather
+   than teaching: take stock of what they have already demonstrated and advance.
+8. Once the key points are covered and one transfer probe is answered, call
+   `mark_section_understood` AND, in the same turn, tell them out loud in one short
+   sentence that they have finished this section and can tap the on-screen button when
+   ready. Never call the tool silently.
 
 You cannot change sections yourself — only the learner's on-screen button advances. If
 they ask to move on after you have signalled readiness, warmly tell them to tap the
@@ -128,15 +139,22 @@ def build_instructions(
     total = len(sections)
     cur: Optional[dict] = sections[idx] if 0 <= idx < total else None
 
+    # The recap is rendered independently of the opening. It used to be attached
+    # only to the "returning learner" opening, so advancing a section mid-session
+    # dropped it entirely — the tutor started the next section knowing nothing
+    # about what the learner had just demonstrated, and asked for it again.
+    recap_block = f"\n{recap}\n" if recap else ""
+
     if advancing:
         opening = (
             "\nThe learner just finished the previous section. In ONE sentence recap what it "
-            "covered, then start teaching THIS section. Do not greet or re-introduce yourself.\n"
+            "covered, then start teaching THIS section. Do not greet or re-introduce yourself. "
+            "Carry forward everything they have already demonstrated — anything they explained "
+            "well a moment ago is settled, and asking for it again wastes their time.\n"
         )
     elif recap:
         opening = (
-            f"\n{recap}\n"
-            "You have taught this learner before. Do NOT introduce yourself. Give a ONE-line "
+            "\nYou have taught this learner before. Do NOT introduce yourself. Give a ONE-line "
             "recap of where they left off, then continue teaching this section.\n"
         )
     else:
@@ -190,6 +208,7 @@ def build_instructions(
     return (
         _CORE.format(doc=doc_name)
         + "\n"
+        + recap_block
         + opening
         + outline
         + section_block

@@ -110,7 +110,7 @@ def create_cohort(
     _set_documents(db, c, doc_ids)
     _set_members(db, c, member_ids, user.workspace_id)
     db.commit()
-    _draft_plans(db, doc_ids, llm.EndUser.verified(token))
+    _draft_plans(db, doc_ids, llm.EndUser.for_user(token, user.name))
     db.refresh(c)
     return workspace.cohort_detail(db, c)
 
@@ -134,7 +134,7 @@ def edit_cohort(
         member_ids = _valid_member_ids(db, user.workspace_id, body.memberUserIds)
         _set_members(db, c, member_ids, user.workspace_id)
     db.commit()
-    _draft_plans(db, new_docs, llm.EndUser.verified(token))
+    _draft_plans(db, new_docs, llm.EndUser.for_user(token, user.name))
     db.refresh(c)
     return workspace.cohort_detail(db, c)
 
@@ -173,7 +173,7 @@ def publish_cohort(
     fresh = not c.published
     for did in doc_ids:
         try:
-            mods = plan_service.ensure_plan(db, did, end_user=llm.EndUser.verified(token))
+            mods = plan_service.ensure_plan(db, did, end_user=llm.EndUser.for_user(token, user.name))
         except plan_service.PlanGenerationError as exc:
             # Publishing a cohort whose document has no teachable plan would put
             # learners in front of a tutor with nothing to check them against.
@@ -323,7 +323,7 @@ def regenerate_plan(
 ) -> dict:
     doc = _own_doc(db, did, user.workspace_id)
     try:
-        mods = plan_service.generate_plan(db, did, end_user=llm.EndUser.verified(token))
+        mods = plan_service.generate_plan(db, did, end_user=llm.EndUser.for_user(token, user.name))
     except meldos.MeldOSError as exc:
         from .sessions import _meldos_http_error
 

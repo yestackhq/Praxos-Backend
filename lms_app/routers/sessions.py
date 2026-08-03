@@ -88,7 +88,9 @@ def _instructions_for(
     modules = plan_service.get_modules(db, doc.id)
     cur = modules[idx] if modules and 0 <= idx < len(modules) else None
     recap = ""
-    if with_recap and not advancing:
+    if with_recap:
+        # Fetched on an advance too. Skipping it there was why a learner who had
+        # explained something in section 1 was asked for it again in section 2.
         recap = memory.recap_for_tutor(
             workspace_id=user.workspace_id,
             user_id=user.id,
@@ -305,7 +307,7 @@ def score_session(
             doc=doc,
             module_idx=module_idx,
             transcript=transcript,
-            end_user=llm.EndUser.verified(token),
+            end_user=llm.EndUser.for_user(token, user.name),
         )
     except meldos.MeldOSError as exc:
         # Do NOT throw the conversation away. Returning an error here meant a

@@ -448,3 +448,47 @@ def test_embedding_failure_does_not_break_indexing(monkeypatch, caplog):
         assert llm.embed_texts(["chunk one", "chunk two"]) is None
         assert llm.embed_one("chunk") is None
     assert "keyword overlap" in caplog.text
+
+
+# ---- attribution must never cost a completion --------------------------------
+
+
+def test_a_rejected_end_user_token_falls_back_to_claimed_attribution(monkeypatch, meldos_on):
+    """Production failure: MeldOS refused the learner's Clerk token, so EVERY
+    grade 401'd and every learner lost their score. Whether a sign-in provider is
+    wired up correctly is a deployment concern — it must not decide whether a
+    finished conversation gets graded."""
+    seen: list[dict] = []
+
+    def fake_post(url, *, headers=None, json=None, timeout=None):  # noqa: A002
+        seen.append(dict(headers or {}))
+        if "X-End-User-Token" in (headers or {}):
+            return httpx.Response(
+                401,
+                text='{"error":{"code":"AUTH_TOKEN_INVALID"}}',
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"ok": true}'}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(meldos.httpx, "post", fake_post)
+
+    out = llm.chat_json("s", "u", end_user=meldos.EndUser.for_user(FAKE_TOKEN, "Kiran Varma"))
+    assert out == {"ok": True}, "the completion must still be returned"
+    assert len(seen) == 2, "should retry exactly once"
+    assert "X-End-User-Token" in seen[0]
+    # The retry keeps the person attached, just claimed rather than verified.
+    assert "X-End-User-Token" not in seen[1]
+    assert seen[1]["X-End-User-Id"] == "Kiran Varma"
+
+
+def test_a_401_without_an_end_user_token_is_a_real_failure(monkeypatch, meldos_on):
+    """A rejected APPLICATION key must still surface — the fallback above is only
+    for the end-user token."""
+    _respond(monkeypatch, 401, body="bad application key")
+    with pytest.raises(meldos.MeldOSError) as err:
+        llm.chat_json("s", "u")
+    assert err.value.status == 401

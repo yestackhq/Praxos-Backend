@@ -71,7 +71,7 @@ def create_team(
     _set_documents(db, t, doc_ids)
     _set_members(db, t, _valid_member_ids(db, user.workspace_id, body.memberUserIds))
     db.commit()
-    _draft_plans(db, doc_ids, llm.EndUser.verified(token))
+    _draft_plans(db, doc_ids, llm.EndUser.for_user(token, user.name))
     db.refresh(t)
     return workspace.team_detail(db, t)
 
@@ -96,7 +96,7 @@ def edit_team(
     if body.memberUserIds is not None:
         _set_members(db, t, _valid_member_ids(db, user.workspace_id, body.memberUserIds))
     db.commit()
-    _draft_plans(db, new_docs, llm.EndUser.verified(token))
+    _draft_plans(db, new_docs, llm.EndUser.for_user(token, user.name))
     db.refresh(t)
     return workspace.team_detail(db, t)
 
@@ -125,7 +125,7 @@ def publish_team(
             status.HTTP_400_BAD_REQUEST, "Add at least one document and one learner before publishing."
         )
     for did in doc_ids:
-        mods = plan_service.ensure_plan(db, did, end_user=llm.EndUser.verified(token))
+        mods = plan_service.ensure_plan(db, did, end_user=llm.EndUser.for_user(token, user.name))
         doc = db.get(models.Document, did)
         if doc is None:
             continue

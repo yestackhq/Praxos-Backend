@@ -83,6 +83,15 @@ class EndUser:
     def claimed(cls, name: Optional[str]) -> "EndUser":
         return cls(name=(name or "").strip() or None)
 
+    @classmethod
+    def for_user(cls, token: Optional[str], name: Optional[str]) -> "EndUser":
+        """Prefer a verified attribution, but keep the name so a rejected token
+        can degrade to a claimed one rather than failing the whole call."""
+        return cls(token=token or None, name=(name or "").strip() or None)
+
+    def without_token(self) -> "EndUser":
+        return EndUser(token=None, name=self.name)
+
     @property
     def empty(self) -> bool:
         return not self.token and not self.name
@@ -158,14 +167,15 @@ def _raise_for_status(resp: httpx.Response) -> None:
     if status < 400:
         return
     body = _safe(resp.text)
-    if status == 401:
-        raise MeldOSError(401, "MeldOS rejected the application key (401). Check MELDOS_APPLICATION_KEY.")
-    if status == 403:
-        raise MeldOSError(
-            403,
-            "MeldOS denied the request (403). The application may lack access to the model "
-            "alias, or the end-user token failed verification.",
-        )
+    if status in (401, 403):
+        # Log the scrubbed body. Returning only a canned message meant a live
+        # failure showed up as "MeldOS 401" with no way to tell an invalid
+        # application key from a rejected end-user token — two very different
+        # problems. _safe() removes the key, so this is safe to log.
+        logger.error("meldos %s: %s", status, body)
+        if status == 401:
+            raise MeldOSError(401, f"MeldOS rejected the request (401). {body}")
+        raise MeldOSError(403, f"MeldOS denied the request (403). {body}")
     if status == 429:
         retry_after = resp.headers.get("Retry-After")
         raise MeldOSError(
@@ -220,6 +230,26 @@ def chat_completion(
     except httpx.HTTPError as exc:
         # exc carries the URL only — never the headers.
         raise MeldOSError(0, f"Could not reach MeldOS: {type(exc).__name__}") from None
+
+    # Attribution is metadata; the completion is the product. If MeldOS refuses
+    # the END-USER token (wrong issuer/audience/shape — all deployment concerns
+    # outside this request), retry once attributing by name instead of failing.
+    # Without this, one misconfigured sign-in integration silently costs every
+    # learner their grade, which is exactly what happened in production.
+    if resp.status_code in (401, 403) and "X-End-User-Token" in headers:
+        logger.warning(
+            "meldos rejected the end-user token (%s); retrying with claimed attribution",
+            resp.status_code,
+        )
+        return chat_completion(
+            messages,
+            end_user=(end_user.without_token() if end_user else None),
+            session_id=session_id,
+            temperature=temperature,
+            response_format=response_format,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
 
     _raise_for_status(resp)
     try:
