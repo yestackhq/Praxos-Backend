@@ -43,6 +43,9 @@ def meldos_on(monkeypatch):
     monkeypatch.setattr(settings, "MELDOS_API_BASE_URL", FAKE_HOST, raising=False)
     monkeypatch.setattr(settings, "MELDOS_APPLICATION_KEY", FAKE_KEY, raising=False)
     monkeypatch.setattr(settings, "MELDOS_MODEL", MODEL_ALIAS, raising=False)
+    # Keep the retry COUNT (that is behaviour under test) but drop the sleep, or
+    # every failure case pays the real backoff and the suite crawls.
+    monkeypatch.setattr(meldos, "TRANSIENT_BACKOFF", 0, raising=False)
     llm._chat_client.cache_clear()
     yield
     llm._chat_client.cache_clear()
@@ -492,3 +495,41 @@ def test_a_401_without_an_end_user_token_is_a_real_failure(monkeypatch, meldos_o
     with pytest.raises(meldos.MeldOSError) as err:
         llm.chat_json("s", "u")
     assert err.value.status == 401
+
+
+def test_a_transient_upstream_failure_is_retried(monkeypatch, meldos_on):
+    """The gateway intermittently answers 502 — observed live, and it cost a
+    finished session its grade. One blip must not."""
+    calls = {"n": 0}
+
+    def flaky(url, **_kw):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(502, text="upstream hiccup", request=httpx.Request("POST", url))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"ok": true}'}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(meldos.httpx, "post", flaky)
+    assert llm.chat_json("s", "u") == {"ok": True}
+    assert calls["n"] == 3
+
+
+def test_a_deterministic_4xx_is_not_retried(monkeypatch, meldos_on):
+    """Asking twice cannot help, and retrying would multiply the cost.
+
+    Asserted against chat_completion, not chat_json: chat_json deliberately
+    retries a 400 ONCE without JSON mode, for gateways that do not implement it.
+    That is a different mechanism from the transient-failure retry."""
+    calls = {"n": 0}
+
+    def bad(url, **_kw):
+        calls["n"] += 1
+        return httpx.Response(400, text="malformed", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(meldos.httpx, "post", bad)
+    with pytest.raises(meldos.MeldOSError):
+        meldos.chat_completion([{"role": "user", "content": "x"}])
+    assert calls["n"] == 1

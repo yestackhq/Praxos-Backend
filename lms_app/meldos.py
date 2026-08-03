@@ -37,6 +37,7 @@ Two hard rules, enforced in this module rather than left to callers:
 """
 
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -49,6 +50,11 @@ from .config import settings
 logger = logging.getLogger("praxos.meldos")
 
 CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
+
+# The gateway intermittently answers 502. Retrying a finished conversation's
+# grade is far cheaper than losing it.
+TRANSIENT_ATTEMPTS = 4
+TRANSIENT_BACKOFF = 1.5
 
 
 class MeldOSError(RuntimeError):
@@ -203,18 +209,16 @@ def chat_completion(
     Raises MeldOSError on any failure. Uses httpx directly rather than an SDK so
     the exact headers sent are visible in one place and no client library can log
     the Authorization header on our behalf.
+
+    Retries transient upstream failures (5xx and transport errors), which this
+    gateway demonstrably emits from time to time — a single 502 should not cost a
+    learner the grade for a conversation they have already finished. Deterministic
+    4xx failures are not retried; there is nothing to gain from asking twice.
     """
     if not enabled():
         raise MeldOSError(0, "MeldOS is not configured (MELDOS_API_BASE_URL / MELDOS_APPLICATION_KEY).")
 
     url = chat_url()
-    headers = {
-        "Authorization": f"Bearer {settings.MELDOS_APPLICATION_KEY}",
-        "Content-Type": "application/json",
-        # Required by MeldOS: groups the calls belonging to one piece of work.
-        "X-Session-ID": session_id or f"praxos-{uuid.uuid4()}",
-        **attribution_headers(end_user, url=url),
-    }
     payload: dict[str, Any] = {"model": settings.MELDOS_MODEL, "messages": messages}
     if temperature is not None:
         payload["temperature"] = temperature
@@ -223,39 +227,64 @@ def chat_completion(
     if max_tokens:
         payload["max_tokens"] = max_tokens
 
-    try:
-        resp = httpx.post(
-            url, headers=headers, json=payload, timeout=timeout or settings.MELDOS_TIMEOUT
-        )
-    except httpx.HTTPError as exc:
-        # exc carries the URL only — never the headers.
-        raise MeldOSError(0, f"Could not reach MeldOS: {type(exc).__name__}") from None
+    sid = session_id or f"praxos-{uuid.uuid4()}"
+    effective_user = end_user
+    token_fallback_used = False
+    last: Optional[MeldOSError] = None
 
-    # Attribution is metadata; the completion is the product. If MeldOS refuses
-    # the END-USER token (wrong issuer/audience/shape — all deployment concerns
-    # outside this request), retry once attributing by name instead of failing.
-    # Without this, one misconfigured sign-in integration silently costs every
-    # learner their grade, which is exactly what happened in production.
-    if resp.status_code in (401, 403) and "X-End-User-Token" in headers:
-        logger.warning(
-            "meldos rejected the end-user token (%s); retrying with claimed attribution",
-            resp.status_code,
-        )
-        return chat_completion(
-            messages,
-            end_user=(end_user.without_token() if end_user else None),
-            session_id=session_id,
-            temperature=temperature,
-            response_format=response_format,
-            max_tokens=max_tokens,
-            timeout=timeout,
-        )
+    for attempt in range(1, TRANSIENT_ATTEMPTS + 1):
+        headers = {
+            "Authorization": f"Bearer {settings.MELDOS_APPLICATION_KEY}",
+            "Content-Type": "application/json",
+            # Required by MeldOS: groups the calls belonging to one piece of work.
+            "X-Session-ID": sid,
+            **attribution_headers(effective_user, url=url),
+        }
+        try:
+            resp = httpx.post(
+                url, headers=headers, json=payload, timeout=timeout or settings.MELDOS_TIMEOUT
+            )
+        except httpx.HTTPError as exc:
+            # exc carries the URL only — never the headers.
+            last = MeldOSError(0, f"Could not reach MeldOS: {type(exc).__name__}")
+            if attempt < TRANSIENT_ATTEMPTS:
+                time.sleep(TRANSIENT_BACKOFF * attempt)
+                continue
+            raise last from None
 
-    _raise_for_status(resp)
-    try:
-        return resp.json()
-    except ValueError:
-        raise MeldOSError(resp.status_code, "MeldOS returned a non-JSON body.") from None
+        # Attribution is metadata; the completion is the product. If MeldOS
+        # refuses the END-USER token (wrong issuer/audience/shape — all
+        # deployment concerns outside this request), drop to claimed attribution
+        # rather than failing. Without this, one misconfigured sign-in
+        # integration silently costs every learner their grade, which is exactly
+        # what happened in production.
+        if (
+            resp.status_code in (401, 403)
+            and "X-End-User-Token" in headers
+            and not token_fallback_used
+        ):
+            logger.warning(
+                "meldos rejected the end-user token (%s); retrying with claimed attribution",
+                resp.status_code,
+            )
+            token_fallback_used = True
+            effective_user = effective_user.without_token() if effective_user else None
+            continue  # does not consume a transient attempt in spirit; bounded by the loop
+
+        if resp.status_code >= 500 and attempt < TRANSIENT_ATTEMPTS:
+            logger.warning(
+                "meldos %s (attempt %s/%s) — retrying", resp.status_code, attempt, TRANSIENT_ATTEMPTS
+            )
+            time.sleep(TRANSIENT_BACKOFF * attempt)
+            continue
+
+        _raise_for_status(resp)
+        try:
+            return resp.json()
+        except ValueError:
+            raise MeldOSError(resp.status_code, "MeldOS returned a non-JSON body.") from None
+
+    raise last or MeldOSError(0, "MeldOS did not return a response.")
 
 
 def completion_text(body: dict) -> Optional[str]:
