@@ -158,3 +158,33 @@ def test_next_section_is_the_first_not_yet_mastered(client):
         _progress(db, u, doc, 1, 40)  # below mastery → resume here
         db.commit()
         assert scoring.next_section_idx(db, u.id, doc.id, 3) == 1
+
+
+def test_completing_the_last_section_unlocks_the_next_document(client):
+    """Whether a score arrives live or from a re-grade, finishing a document has
+    to open the next one — otherwise the learner is stuck on a document that
+    reads 100% complete."""
+    from lms_app.config import settings
+
+    with SessionLocal() as db:
+        ws, u, doc = _fixture(db, name="Unlock", minutes=[5, 5])
+        nxt = models.Document(workspace_id=ws.id, name="Unlock Next", chunk_count=1)
+        db.add(nxt)
+        db.flush()
+        db.add(models.Module(document_id=nxt.id, idx=0, title="N0", minutes=5))
+        db.add_all([
+            models.LearningPathItem(user_id=u.id, document_id=doc.id, idx=0, status="in_progress"),
+            models.LearningPathItem(user_id=u.id, document_id=nxt.id, idx=1, status="locked"),
+        ])
+        _progress(db, u, doc, 0, 90)
+        _progress(db, u, doc, 1, 88)
+        db.commit()
+
+        scoring.refresh_path_item(db, user_id=u.id, document_id=doc.id, total_sections=2)
+        db.commit()
+
+        items = {i.document_id: i.status for i in db.query(models.LearningPathItem).all()}
+        assert items[doc.id] == "mastered"
+        assert items[nxt.id] == "up_next", "the next document must open"
+        assert scoring.document_completion(db, u.id, doc.id) == 100
+        assert scoring.document_understanding(db, u.id, doc.id) >= settings.MASTERY_THRESHOLD

@@ -252,11 +252,11 @@ def apply_session(
         prog.status = "in_progress"
     prog.updated_at = models.utcnow()
 
-    _refresh_path_item(db, user_id=user.id, document_id=document.id, total_sections=total_sections)
+    refresh_path_item(db, user_id=user.id, document_id=document.id, total_sections=total_sections)
     return session_row
 
 
-def _refresh_path_item(db: Session, *, user_id: int, document_id: int, total_sections: int) -> None:
+def refresh_path_item(db: Session, *, user_id: int, document_id: int, total_sections: int) -> None:
     """Recompute this document's standing on the learner's path, and unlock the
     next document once it is genuinely mastered."""
     item = db.scalar(

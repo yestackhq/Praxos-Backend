@@ -123,6 +123,16 @@ def main(apply: bool, redo_all: bool) -> int:
             prog.last_score = row.score
             prog.best_score = row.score if prog.best_score is None else max(prog.best_score, row.score)
             prog.updated_at = models.utcnow()
+            # Fold it into the learner's PATH too, not just their score. Without
+            # this a re-grade that completed someone's final section left the
+            # document at 100% while its path item stayed in_progress, so the
+            # next document never unlocked and the learner was stuck.
+            scoring.refresh_path_item(
+                db,
+                user_id=user.id,
+                document_id=doc.id,
+                total_sections=len(plan_service.get_modules(db, doc.id)),
+            )
             db.commit()
 
             print(f"{label}: {row.score}/100 — {row.summary[:70]}")
