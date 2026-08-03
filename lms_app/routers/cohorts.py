@@ -371,26 +371,40 @@ def save_plan(did: int, body: PlanPatch, user: models.User = Depends(_admin), db
     section-by-section grounding survives a title/topic edit."""
     doc = _own_doc(db, did, user.workspace_id)
     old = plan_service.get_modules(db, did)
-    db.execute(delete(models.Module).where(models.Module.document_id == did))
+    # Resolve and validate every section BEFORE touching the stored plan: a
+    # section that ends up with no key points or check questions is unteachable
+    # and ungradable — the learner would meet a section with nothing in it.
+    resolved: list[models.Module] = []
     for i, m in enumerate(body.modules):
-        cs = old[i].chunk_start if i < len(old) else 0
-        ce = old[i].chunk_end if i < len(old) else 0
-        db.add(
+        key_points = [str(t)[:400] for t in m.keyPoints][:6] or (
+            list(old[i].key_points or []) if i < len(old) else []
+        )
+        check_questions = [str(t)[:300] for t in m.checkQuestions][:5] or (
+            list(old[i].check_questions or []) if i < len(old) else []
+        )
+        if not key_points or not check_questions:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Section {i + 1} ('{m.title[:80]}') has no key points or check questions, so "
+                "the tutor would have nothing to teach or check. Add them or remove the section.",
+            )
+        resolved.append(
             models.Module(
                 document_id=did,
                 idx=i,
                 title=m.title[:160],
                 description=m.description[:2000],
                 topics=[str(t)[:80] for t in m.topics][:6],
-                key_points=[str(t)[:400] for t in m.keyPoints][:6]
-                or (list(old[i].key_points or []) if i < len(old) else []),
-                check_questions=[str(t)[:300] for t in m.checkQuestions][:5]
-                or (list(old[i].check_questions or []) if i < len(old) else []),
+                key_points=key_points,
+                check_questions=check_questions,
                 minutes=max(2, min(20, m.minutes or 5)),
-                chunk_start=cs,
-                chunk_end=ce,
+                chunk_start=old[i].chunk_start if i < len(old) else 0,
+                chunk_end=old[i].chunk_end if i < len(old) else 0,
             )
         )
+    db.execute(delete(models.Module).where(models.Module.document_id == did))
+    for mod in resolved:
+        db.add(mod)
     db.commit()
     mods = plan_service.get_modules(db, did)
     return {

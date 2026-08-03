@@ -98,6 +98,22 @@ def generate_plan(
                 "left untouched; retry rather than teaching from an unchecked one."
             )
         sections = _fallback_sections(doc.name, len(chunks))
+    else:
+        # A model plan may also be PARTIALLY unusable: a section with no
+        # key_points/check_questions gives the tutor nothing to check and the
+        # grader no ground truth — the learner meets a section with nothing to
+        # teach. Refuse the whole plan rather than persisting a hollow section.
+        hollow = [
+            str(s.get("title") or f"section {i + 1}")
+            for i, s in enumerate(sections)
+            if not (s.get("key_points") and s.get("check_questions"))
+        ]
+        if hollow:
+            raise PlanGenerationError(
+                f"The model's plan for '{doc.name}' left {', '.join(hollow)} without key points "
+                "or check questions, so it cannot be taught or graded. The existing plan was "
+                "left untouched; retry."
+            )
 
     db.execute(delete(models.Module).where(models.Module.document_id == document_id))
     db.flush()
