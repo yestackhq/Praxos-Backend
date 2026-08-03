@@ -9,6 +9,7 @@ These pin down the three behaviours that were wrong in production:
 """
 
 from lms_app import models, scoring
+from lms_app.config import settings
 from lms_app.db import SessionLocal
 
 
@@ -151,13 +152,21 @@ def test_cohort_scoping(client):
         assert scoring.cohort_understanding(db, c_a.id) == 60
 
 
-def test_next_section_is_the_first_not_yet_mastered(client):
+def test_next_section_is_the_first_one_not_yet_sat(client):
+    """Resume follows PROGRESS, not mastery. It used to return the first section
+    below the mastery threshold, which permanently pinned anyone who scored just
+    under it — see test_a_weak_section_does_not_lock_a_learner_out_of_the_document."""
     with SessionLocal() as db:
         _, u, doc = _fixture(db, name="Next", minutes=[5, 5, 5])
-        _progress(db, u, doc, 0, 85)
-        _progress(db, u, doc, 1, 40)  # below mastery → resume here
+        db.add_all([
+            models.SectionProgress(user_id=u.id, document_id=doc.id, module_idx=0,
+                                   best_score=85, last_score=85, attempts=1),
+            models.SectionProgress(user_id=u.id, document_id=doc.id, module_idx=1,
+                                   best_score=40, last_score=40, attempts=1),
+        ])
         db.commit()
-        assert scoring.next_section_idx(db, u.id, doc.id, 3) == 1
+        # Section 2 was weak but it WAS sat, so the learner moves on to section 3.
+        assert scoring.next_section_idx(db, u.id, doc.id, 3) == 2
 
 
 def test_completing_the_last_section_unlocks_the_next_document(client):
@@ -251,3 +260,33 @@ def test_score_index_matches_cohort_and_team_rollups(client):
             scoring.cohort_member_ids(db, c.id), scoring.cohort_document_ids(db, c.id)
         ) == scoring.cohort_completion(db, c.id)
         assert idx.group_understanding([u.id], [doc.id]) == scoring.team_understanding(db, t.id)
+
+
+def test_a_weak_section_does_not_lock_a_learner_out_of_the_document(client):
+    """Resume is a bookmark, not a gate. Requiring mastery to move on meant a
+    learner stuck at 65 on section 2 was returned there forever and could never
+    reach section 3 — observed in production across four sittings."""
+    with SessionLocal() as db:
+        _, u, doc = _fixture(db, name="NotStuck", minutes=[5, 5, 5])
+        db.add_all([
+            models.SectionProgress(user_id=u.id, document_id=doc.id, module_idx=0,
+                                   best_score=92, last_score=92, attempts=1),
+            # Sat repeatedly, never reached the mastery threshold.
+            models.SectionProgress(user_id=u.id, document_id=doc.id, module_idx=1,
+                                   best_score=65, last_score=50, attempts=4),
+        ])
+        db.commit()
+
+        assert scoring.next_section_idx(db, u.id, doc.id, 3) == 2, "must move on to section 3"
+        # The score still tells the truth: that section is NOT mastered.
+        assert scoring.document_completion(db, u.id, doc.id) == 33
+        assert scoring.document_understanding(db, u.id, doc.id) < settings.MASTERY_THRESHOLD
+
+
+def test_resume_returns_to_the_first_unsat_section(client):
+    with SessionLocal() as db:
+        _, u, doc = _fixture(db, name="Bookmark", minutes=[5, 5, 5])
+        db.add(models.SectionProgress(user_id=u.id, document_id=doc.id, module_idx=0,
+                                      best_score=80, last_score=80, attempts=1))
+        db.commit()
+        assert scoring.next_section_idx(db, u.id, doc.id, 3) == 1

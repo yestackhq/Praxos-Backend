@@ -298,14 +298,41 @@ def refresh_path_item(db: Session, *, user_id: int, document_id: int, total_sect
         item.status = "in_progress"
 
 
+def attempted_sections(db: Session, user_id: int, document_id: int) -> set[int]:
+    """Sections the learner has actually sat, scored or not."""
+    return {
+        int(i)
+        for i in db.scalars(
+            select(models.SectionProgress.module_idx).where(
+                models.SectionProgress.user_id == user_id,
+                models.SectionProgress.document_id == document_id,
+                models.SectionProgress.attempts > 0,
+            )
+        ).all()
+    }
+
+
 def next_section_idx(db: Session, user_id: int, document_id: int, total_sections: int) -> int:
-    """Where the learner should resume: the first section not yet taken to
-    mastery, else the last one."""
+    """Where the learner should resume: the first section they have not sat yet,
+    else the last one.
+
+    This used to return the first section below the MASTERY threshold, which made
+    the resume point a gate rather than a bookmark. A learner whose best on a
+    section was 65 — five points short — was returned to it every single time and
+    could never reach the rest of the document, however many times they sat it.
+    One learner did so four times, for 33, 19, 20 and 5 answers.
+
+    Progress and understanding are different things and the schema already keeps
+    them apart: the document score still reflects that weak section honestly and
+    still counts it against mastery, so nothing is being waved through. The
+    learner is simply allowed to carry on, and can redo a section deliberately
+    (``restart``) to raise it.
+    """
     if total_sections <= 0:
         return 0
-    bests = section_bests(db, user_id, document_id)
+    attempted = attempted_sections(db, user_id, document_id)
     for idx in range(total_sections):
-        if bests.get(idx, 0) < settings.MASTERY_THRESHOLD:
+        if idx not in attempted:
             return idx
     return total_sections - 1
 
