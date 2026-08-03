@@ -413,3 +413,42 @@ def test_advance_tool_floor_is_low_enough_to_be_reachable():
 
     src = inspect.getsource(agent_mod.TutorAgent.mark_section_understood)
     assert "< 4" in src and "< 40" in src, src[-400:]
+
+
+def test_a_sitting_with_no_learner_speech_is_not_recorded_as_attempting_a_section(client):
+    """The phantom sittings. Every 'Section N+1' row in production held exactly one
+    tutor line — "You have finished this section, tap the button" — and zero
+    learner turns. It must not count as having sat that section, or the resume
+    point skips past a section the learner never saw."""
+    from lms_app import models, scoring
+    from lms_app.db import SessionLocal
+
+    with SessionLocal() as db:
+        ws = models.Workspace(name="Phantom", plan="x")
+        db.add(ws)
+        db.flush()
+        u = models.User(clerk_id="ph_u", workspace_id=ws.id, name="P", email="p@x.dev", role="Learner")
+        doc = models.Document(workspace_id=ws.id, name="Phantom Doc", chunk_count=3)
+        db.add_all([u, doc])
+        db.flush()
+        for i in range(3):
+            db.add(models.Module(document_id=doc.id, idx=i, title=f"S{i}", minutes=5))
+        db.commit()
+
+        # Section 1 sat properly; section 2 gets only the trailing tutor line.
+        scoring.apply_session(
+            db, user=u, document=doc, module_idx=0,
+            transcript=[{"role": "learner", "text": "A mechanism is how the product creates the change."}],
+            result={"scoreable": True, "score": 80, "covered": 100, "topics": []},
+            paused=False, total_sections=3,
+        )
+        scoring.apply_session(
+            db, user=u, document=doc, module_idx=1,
+            transcript=[{"role": "tutor", "text": "You have finished this section. Tap the button."}],
+            result={"scoreable": False, "score": None, "topics": []},
+            paused=False, total_sections=3,
+        )
+        db.commit()
+
+        assert scoring.attempted_sections(db, u.id, doc.id) == {0}, "section 2 was never really sat"
+        assert scoring.next_section_idx(db, u.id, doc.id, 3) == 1, "must resume at section 2, not skip it"
