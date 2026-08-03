@@ -24,6 +24,25 @@ def section_material(chunks: list[str]) -> str:
     return "\n\n".join(chunks)[:MAX_CONTEXT_CHARS]
 
 
+def replay_tail(transcript: list[dict], max_chars: int = 2500) -> str:
+    """The tail of an interrupted sitting's conversation, formatted for the
+    tutor's instructions. Keeps the most recent turns that fit — the end of the
+    conversation is where 'continue from where you left off' lives."""
+    lines = [
+        f"{'LEARNER' if t.get('role') == 'learner' else 'TUTOR'}: {t.get('text', '').strip()}"
+        for t in transcript
+        if t.get("text", "").strip()
+    ]
+    tail: list[str] = []
+    used = 0
+    for ln in reversed(lines):
+        if used + len(ln) > max_chars:
+            break
+        tail.append(ln)
+        used += len(ln) + 1
+    return "\n".join(reversed(tail))
+
+
 # The tutor calls this ONLY once the learner has demonstrated the section. It takes
 # arguments on purpose: a model that must quote the learner's own explanation and
 # name which key points were covered cannot fire the tool on "yeah, got it" — and
@@ -132,6 +151,7 @@ def build_instructions(
     recap: str = "",
     resumed: bool = False,
     advancing: bool = False,
+    replay: str = "",
 ) -> str:
     """The full instruction block for one section.
 
@@ -200,7 +220,16 @@ def build_instructions(
                 "This is the FINAL section: once they have demonstrated it, wrap the whole "
                 "document up in a sentence or two, then call `mark_section_understood`.\n"
             )
-        if resumed:
+        if resumed and replay:
+            section_block += (
+                "\n--- THE INTERRUPTED CONVERSATION (this section, where you left off) ---\n"
+                f"{replay}\n"
+                "That conversation was cut off — continue it exactly where it stopped. "
+                "Acknowledge the interruption in one short sentence, then pick up from the last "
+                "unanswered point. Anything the learner already answered above is settled; never "
+                "ask for it again.\n"
+            )
+        elif resumed:
             section_block += (
                 "The learner PAUSED partway through this section last time. Recall from the "
                 "recap where you left off, briefly reorient them, and CONTINUE from there — "

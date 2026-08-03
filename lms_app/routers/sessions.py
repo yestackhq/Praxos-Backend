@@ -16,6 +16,7 @@ The agent worker authenticates with the shared ``AGENT_SHARED_SECRET`` on the
 
 import logging
 import secrets
+from datetime import timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -97,6 +98,22 @@ def _instructions_for(
             document_id=doc.id,
             doc_name=doc.name,
         )
+    replay = ""
+    if resumed:
+        # The interrupted sitting's actual conversation, replayed into the
+        # tutor's context. Distilled memory facts cannot say which questions
+        # were already asked and answered — the stored transcript can.
+        last = db.scalar(
+            select(models.LearningSession)
+            .where(
+                models.LearningSession.user_id == user.id,
+                models.LearningSession.document_id == doc.id,
+                models.LearningSession.module_idx == idx,
+            )
+            .order_by(models.LearningSession.started_at.desc())
+        )
+        if last is not None and last.transcript:
+            replay = tutor.replay_tail(list(last.transcript))
     text = tutor.build_instructions(
         doc_name=doc.name,
         sections=[plan_service.module_payload(m) for m in modules],
@@ -105,6 +122,7 @@ def _instructions_for(
         recap=recap,
         resumed=resumed,
         advancing=advancing,
+        replay=replay,
     )
     return text, modules
 
@@ -457,6 +475,10 @@ class AgentContextIn(BaseModel):
     documentId: int
     moduleIdx: int = 0
     advancing: bool = False
+    # The worker may be a replacement dispatched by a reconnect; its moduleIdx
+    # is where the sitting STARTED. locate asks the API to resolve the
+    # learner's actual current section from the database.
+    locate: bool = False
 
 
 @router.post("/agent/context", dependencies=[Depends(_agent_auth)])
@@ -469,12 +491,31 @@ def agent_context(body: AgentContextIn, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown session")
     modules = plan_service.get_modules(db, doc.id)
     total = len(modules)
+    located: Optional[int] = None
+    if body.locate:
+        # A section a dying worker (or an explicit pause) marked `paused` in
+        # the recent past is where the learner actually is — regardless of the
+        # index stamped into the room metadata when the sitting began. The
+        # window keeps this a reconnect affordance: an old pause goes through
+        # start_session's own resume logic instead.
+        recent = db.scalar(
+            select(models.SectionProgress)
+            .where(
+                models.SectionProgress.user_id == user.id,
+                models.SectionProgress.document_id == doc.id,
+                models.SectionProgress.status == "paused",
+                models.SectionProgress.updated_at >= models.utcnow() - timedelta(minutes=30),
+            )
+            .order_by(models.SectionProgress.updated_at.desc())
+        )
+        if recent is not None and total:
+            located = max(0, min(int(recent.module_idx), total - 1))
     # Advancing PAST the last section must be reported, not clamped. Clamping
     # silently returned the final section again, so the worker re-taught the
     # section the learner had just finished and the UI looked stuck on it.
-    if total and body.moduleIdx >= total:
+    if located is None and total and body.moduleIdx >= total:
         return {"complete": True, "moduleIdx": total - 1, "totalModules": total}
-    idx = max(0, min(body.moduleIdx, max(0, total - 1)))
+    idx = located if located is not None else max(0, min(body.moduleIdx, max(0, total - 1)))
     prog = db.scalar(
         select(models.SectionProgress).where(
             models.SectionProgress.user_id == user.id,

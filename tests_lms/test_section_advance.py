@@ -94,7 +94,9 @@ def test_current_turn_is_stopped_before_the_swap():
     asyncio.run(advance(1))
 
     assert session.calls == ["interrupt", "update_instructions", "generate_reply"], session.calls
-    assert agent.instructions == ["teach section 1"]
+    # The fetched instructions come first; the previous section's hand-off
+    # digest (see test_reconnect_resume) rides behind them.
+    assert agent.instructions[0].startswith("teach section 1")
     assert ctx.module_idx == 1
     assert published[-1]["type"] == "section_changed"
     assert published[-1]["moduleIdx"] == 1
@@ -220,14 +222,17 @@ def test_two_taps_in_flight_do_not_interleave():
 
 def test_advancing_marks_the_section_as_graded_by_the_browser():
     """The browser grades the section it is leaving (it holds the learner's token,
-    so the spend is attributed to them as verified). Without this flag the
-    worker's disconnect safety net graded the same turns again — two sittings
-    recorded and two billed model calls for one conversation."""
+    so the spend is attributed to them as verified). The worker's safety net must
+    not grade those turns again — after the swap they sit BEHIND the section
+    boundary, so section_turns() has nothing left to re-grade. The flag itself is
+    re-armed for the new section (test_reconnect_resume), because leaving it set
+    discarded everything said after the first advance on an unclean exit."""
     ctx = _ctx(module_idx=0)
     assert ctx.client_scored is False
     _, _, _, advance = _harness(ctx, _ok(1))
     asyncio.run(advance(1))
-    assert ctx.client_scored is True
+    assert ctx.scored_upto == len(ctx.transcript)
+    assert ctx.section_turns() == [], "nothing left for the safety net to re-grade"
 
 
 # ---- the backend half of the same bug ---------------------------------------

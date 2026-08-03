@@ -128,7 +128,9 @@ def _headers() -> dict:
     return {"X-Agent-Secret": AGENT_SECRET, "Content-Type": "application/json"}
 
 
-async def fetch_context(ctx: SessionContext, *, advancing: bool = False) -> Optional[dict]:
+async def fetch_context(
+    ctx: SessionContext, *, advancing: bool = False, locate: bool = False
+) -> Optional[dict]:
     async with httpx.AsyncClient(timeout=20) as client:
         try:
             resp = await client.post(
@@ -140,6 +142,11 @@ async def fetch_context(ctx: SessionContext, *, advancing: bool = False) -> Opti
                     "documentId": ctx.document_id,
                     "moduleIdx": ctx.module_idx,
                     "advancing": advancing,
+                    # A replacement worker (dispatched by a reconnect after the
+                    # previous one died) carries the section index the SITTING
+                    # started on, not where the learner actually is. `locate`
+                    # asks the API to resolve the real position from the DB.
+                    "locate": locate,
                 },
             )
             resp.raise_for_status()
@@ -205,6 +212,34 @@ async def _publish(room: rtc.Room, payload: dict) -> None:
         logger.debug("publish_data failed: %s", exc)
 
 
+def _handoff_block(turns: list[dict], max_chars: int = 2000) -> str:
+    """The finished section's exchange, carried into the next section's
+    instructions. The recap fetched from the memory service cannot contain it —
+    grading and memory ingestion are still running when the swap happens — so
+    the worker, which holds the turns, hands them over directly."""
+    lines = [
+        f"{'LEARNER' if t.get('role') == 'learner' else 'TUTOR'}: {t.get('text', '').strip()}"
+        for t in turns
+        if t.get("text", "").strip()
+    ]
+    if not lines:
+        return ""
+    tail: list[str] = []
+    used = 0
+    for ln in reversed(lines):
+        if used + len(ln) > max_chars:
+            break
+        tail.append(ln)
+        used += len(ln) + 1
+    if not tail:
+        return ""
+    return (
+        "\n\n--- WHAT WAS JUST SAID IN THE PREVIOUS SECTION (same conversation) ---\n"
+        + "\n".join(reversed(tail))
+        + "\nEverything the learner demonstrated above is settled. Build on it and never ask for it again."
+    )
+
+
 async def advance_section(
     target: int,
     *,
@@ -264,13 +299,24 @@ async def advance_section(
             )
             return
 
+        # The section being left, captured BEFORE the boundary moves: handed to
+        # the next section's instructions so cross-section carry-over does not
+        # depend on the memory service having ingested a grade that is still
+        # being computed.
+        handoff = _handoff_block(sctx.section_turns())
+
         sctx.module_idx = int(nxt.get("moduleIdx", target))
         sctx.is_last = bool(nxt.get("isLast", True))
         sctx.total_modules = int(nxt.get("totalModules") or sctx.total_modules)
         sctx.scored_upto = len(sctx.transcript)
         sctx.posted = False
+        # Re-arm the shutdown safety net for the NEW section. client_scored
+        # covers only the turns the browser graded when it asked to advance;
+        # leaving it True meant everything said after the first advance was
+        # discarded if the sitting ended without a clean goodbye.
+        sctx.client_scored = False
 
-        await agent.update_instructions(nxt["instructions"])
+        await agent.update_instructions(nxt["instructions"] + handoff)
         await (publish or _publish)(
             room,
             {
@@ -406,7 +452,11 @@ async def entrypoint(ctx: JobContext):
         logger.error("room %s has no usable praxos metadata; leaving", room.name)
         return
 
-    bootstrap = await fetch_context(sctx)
+    # locate=True: this worker may be a REPLACEMENT — dispatched by a browser
+    # reconnecting after the previous worker died mid-sitting (laptop sleep).
+    # The metadata's moduleIdx is where the sitting STARTED; the API resolves
+    # where the learner actually is now.
+    bootstrap = await fetch_context(sctx, locate=True)
     if not bootstrap:
         await _publish(room, {"type": "error", "message": "Could not load the lesson."})
         return
@@ -524,6 +574,19 @@ async def entrypoint(ctx: JobContext):
         room=room,
         agent=agent,
         room_input_options=RoomInputOptions(close_on_disconnect=True),
+    )
+    # Announce which section this worker is teaching. The browser uses it to
+    # notice a REPLACEMENT agent (reconnect after the previous worker died) and
+    # re-sync its section state instead of assuming continuity.
+    await _publish(
+        room,
+        {
+            "type": "agent_ready",
+            "moduleIdx": sctx.module_idx,
+            "moduleTitle": bootstrap.get("moduleTitle"),
+            "totalModules": sctx.total_modules,
+            "isLast": sctx.is_last,
+        },
     )
     # Teach first — never wait for the learner to speak.
     session.generate_reply()
