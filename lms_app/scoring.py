@@ -229,12 +229,20 @@ def apply_session(
     scoreable = bool(result.get("scoreable"))
     score = result.get("score") if scoreable else None
 
+    # covered=0 is a real value — an outage sitting, or a section that was never
+    # actually taught. `or 100` was rewriting it as "fully covered", which made
+    # empty sittings indistinguishable from full assessments.
+    try:
+        covered = max(0, min(100, int(result.get("covered"))))
+    except (TypeError, ValueError):
+        covered = 100
+
     session_row = models.LearningSession(
         user_id=user.id,
         document_id=document.id,
         module_idx=module_idx,
         score=score,
-        covered=int(result.get("covered", 100) or 100),
+        covered=covered,
         summary=str(result.get("summary", ""))[:2000],
         topics=result.get("topics") or [],
         strengths=[str(s) for s in (result.get("strengths") or [])],

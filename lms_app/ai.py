@@ -310,11 +310,23 @@ def score_understanding(
     )
     if not data:
         return None
-    score = data.get("score")
-    if score is None:
-        return None
+    # A grader that answers without a usable number ("N/A", "", a missing field)
+    # is declining to grade, not awarding zero. Coercing those to 0 recorded a
+    # hard zero against the section — which then dragged the whole document down.
+    try:
+        score = int(data.get("score"))
+    except (TypeError, ValueError):
+        return {
+            "scoreable": False,
+            "score": None,
+            "summary": str(data.get("summary") or "")
+            or "The assessor returned no usable score; the sitting is saved unscored.",
+            "topics": [],
+            "strengths": [],
+            "gaps": [],
+        }
     data["scoreable"] = True
-    data["score"] = max(0, min(100, _as_int(score, 0)))
+    data["score"] = max(0, min(100, score))
     data["covered"] = max(0, min(100, _as_int(data.get("covered"), 100)))
     return data
 

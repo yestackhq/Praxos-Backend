@@ -293,8 +293,34 @@ def score_session(
         )
         .order_by(models.SectionProgress.updated_at.desc())
     )
-    module_idx = body.moduleIdx if body.moduleIdx is not None else int(prog_idx or 0)
-    module_idx = max(0, min(module_idx, max(0, total - 1)))
+    module_idx = max(0, body.moduleIdx if body.moduleIdx is not None else int(prog_idx or 0))
+    if total and module_idx >= total:
+        # A grade for a section past the end of the plan. Clamping it onto the
+        # final REAL section let a phantom, near-empty sitting overwrite the
+        # learner's last-section score and sink the document (agent_context
+        # already reports "complete" instead of clamping, for the same reason).
+        # Past the end means the course is over: report standing, grade nothing.
+        doc_score = scoring.document_understanding(db, user.id, doc.id)
+        completion = scoring.document_completion(db, user.id, doc.id)
+        return {
+            "score": None,
+            "scoreable": False,
+            "graded": True,
+            "summary": "This document has no further sections, so there was nothing to grade.",
+            "topics": [],
+            "strengths": [],
+            "gaps": [],
+            "understanding": doc_score,
+            "band": scoring.band(doc_score),
+            "documentUnderstanding": doc_score,
+            "completion": completion,
+            "sectionBests": scoring.section_bests(db, user.id, doc.id),
+            "moduleIdx": total - 1,
+            "totalModules": total,
+            "courseComplete": completion >= 100,
+            "paused": body.paused,
+        }
+    module_idx = min(module_idx, max(0, total - 1))
 
     # The learner is signed in and this is their own request, so forward their
     # token for VERIFIED attribution. meldos.py refuses to attach it to anything
@@ -501,6 +527,11 @@ def agent_score(body: AgentScoreIn, db: Session = Depends(get_db)) -> dict:
         return {"recorded": False}
 
     modules = plan_service.get_modules(db, doc.id)
+    if modules and body.moduleIdx >= len(modules):
+        # Safety-net grade for a section past the end of the plan. No such
+        # section exists; clamping it onto the final real one is how phantom
+        # sittings poisoned last-section scores.
+        return {"recorded": False, "reason": "module index past the end of the plan"}
     idx = max(0, min(body.moduleIdx, max(0, len(modules) - 1)))
     # The agent worker authenticates with a service secret and never holds the
     # learner's token, so attribution here is CLAIMED, by name.
