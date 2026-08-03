@@ -356,3 +356,60 @@ def test_advance_tool_schema_advertises_a_number():
 
     prop = ADVANCE_TOOL["parameters"]["properties"]["confidence"]
     assert prop["type"] == "number", "integer makes a 0-1 confidence fail validation"
+
+
+# ---- the tutor is speaking, not writing --------------------------------------
+
+
+def test_prompt_forbids_written_formatting():
+    """Everything the tutor produces is read aloud by Cartesia. A live session
+    produced arrows, colons-as-labels and quoted blocks, which are spoken
+    literally and are gibberish to the ear."""
+    from lms_app import tutor
+
+    text = tutor.build_instructions(
+        doc_name="D",
+        sections=[{"idx": 0, "title": "S", "description": "d", "topics": [],
+                   "key_points": ["k"], "check_questions": ["q"]}],
+        idx=0,
+        material="m",
+    )
+    # Collapse whitespace: the prompt is hand-wrapped prose, so a phrase can be
+    # split across lines. Asserting on raw text would fail on a reflow.
+    lowered = " ".join(text.lower().split())
+    assert "converted straight to speech" in lowered
+    for rule in ("no markdown", "no bullet points", "no numbered lists"):
+        assert rule in lowered, rule
+    # Brevity has to be stated as a hard limit, not a preference.
+    assert "two or three sentences" in lowered
+    assert "hard limit" in lowered
+
+
+def test_prompt_biases_towards_advancing():
+    """The reported failure was being pinned to section one while the tutor kept
+    asking questions."""
+    from lms_app import tutor
+
+    text = tutor.build_instructions(
+        doc_name="D",
+        sections=[{"idx": 0, "title": "S", "description": "d", "topics": [],
+                   "key_points": ["k"], "check_questions": ["q"]}],
+        idx=0,
+        material="m",
+    )
+    lowered = " ".join(text.lower().split())
+    assert "when in doubt, advance" in lowered
+    assert "one good answer is enough" in lowered
+    # Asking to move on must be honoured immediately.
+    assert "ask to move on" in lowered
+
+
+def test_advance_tool_floor_is_low_enough_to_be_reachable():
+    """This guard exists to stop the tool firing on 'yeah, ok' — not to
+    second-guess the tutor. Set high, it became the thing keeping learners stuck."""
+    import inspect
+
+    from voice_agent import agent as agent_mod
+
+    src = inspect.getsource(agent_mod.TutorAgent.mark_section_understood)
+    assert "< 4" in src and "< 40" in src, src[-400:]

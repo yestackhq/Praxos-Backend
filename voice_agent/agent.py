@@ -360,10 +360,14 @@ class TutorAgent(Agent):
             score *= 100.0
         # The gate: a model that cannot produce the learner's own words has not
         # heard an explanation. This is what stops "yeah, got it" from passing.
-        if len(learner_explanation.split()) < 6 or score < 60:
+        # A low floor on purpose. This exists only to stop the tool firing on
+        # "yeah, ok" — not to second-guess the tutor. Set high it became the thing
+        # that kept learners pinned to section one, which costs far more than
+        # advancing someone a little early.
+        if len(learner_explanation.split()) < 4 or score < 40:
             return (
-                "Not enough evidence to advance. Ask the learner to explain the idea in their "
-                "own words, then probe with a fresh example before calling this again."
+                "Not enough evidence yet. Ask them to say the idea in their own words, then "
+                "call this again — one clear answer is enough."
             )
         await _publish(
             self._room,
