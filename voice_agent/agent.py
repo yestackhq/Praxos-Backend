@@ -508,11 +508,11 @@ async def entrypoint(ctx: JobContext):
         # mid-answer and the turn went unresponsive. Three minutes of 16kHz
         # mono is ~11MB; memory is the cheap side of this trade.
         vad=silero.VAD.load(max_buffered_speech=180.0),
-        # Deepgram finals were arriving AFTER the turn had been committed (the
-        # library warns exactly this), so the tutor answered a truncated
-        # transcript. 0.8s past last speech before committing buys the final
-        # segment time to land, at ~0.3s extra reply latency.
-        turn_handling={"endpointing": {"min_delay": 0.8}},
+        # NO turn_handling override. Setting {"endpointing": {"min_delay": 0.8}}
+        # here stopped live transcription reaching the room: the browser's
+        # transcript stayed empty for a whole sitting, so the section grade it
+        # posts on advance had nothing in it and a real conversation was lost
+        # unscored. The library's late-final warning is cosmetic by comparison.
         # Word timings from Cartesia ride along with the transcript, so the
         # browser can highlight the word being spoken instead of guessing.
         use_tts_aligned_transcript=True,
