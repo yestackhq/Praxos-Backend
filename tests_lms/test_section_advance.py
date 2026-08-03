@@ -33,8 +33,9 @@ class FakeSession:
             raise RuntimeError("nothing to interrupt")
         self.calls.append("interrupt")
 
-    def generate_reply(self):
+    def generate_reply(self, **kwargs):
         self.calls.append("generate_reply")
+        self.reply_instructions = kwargs.get("instructions")
 
 
 class FakeAgent:

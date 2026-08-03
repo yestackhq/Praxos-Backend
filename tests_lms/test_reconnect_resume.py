@@ -43,6 +43,10 @@ def test_next_section_instructions_carry_the_previous_sections_words():
     assert "teach section 1" in swapped
     assert "PREVIOUS SECTION" in swapped
     assert "ten step onboarding flow" in swapped
+    # Learner turns ONLY: carrying the tutor's side put its closing line at the
+    # end of the new instructions and the model opened the next section by
+    # repeating "you have finished this section, tap the button".
+    assert "What is a mechanism?" not in swapped
 
 
 def _seeded_doc(client, monkeypatch, clerk_id: str):

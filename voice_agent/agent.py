@@ -213,14 +213,19 @@ async def _publish(room: rtc.Room, payload: dict) -> None:
 
 
 def _handoff_block(turns: list[dict], max_chars: int = 2000) -> str:
-    """The finished section's exchange, carried into the next section's
-    instructions. The recap fetched from the memory service cannot contain it —
-    grading and memory ingestion are still running when the swap happens — so
-    the worker, which holds the turns, hands them over directly."""
+    """The LEARNER's words from the finished section, carried into the next
+    section's instructions. The recap fetched from the memory service cannot
+    contain them — grading and memory ingestion are still running when the swap
+    happens — so the worker, which holds the turns, hands them over directly.
+
+    Learner turns ONLY. Including the tutor's side put its own closing line
+    ("you have finished this section, tap the button") at the very end of the
+    new instructions — and the model opened the NEXT section by parroting it,
+    which looked exactly like being stuck on the finished section."""
     lines = [
-        f"{'LEARNER' if t.get('role') == 'learner' else 'TUTOR'}: {t.get('text', '').strip()}"
+        f"LEARNER: {t.get('text', '').strip()}"
         for t in turns
-        if t.get("text", "").strip()
+        if t.get("role") == "learner" and t.get("text", "").strip()
     ]
     if not lines:
         return ""
@@ -234,9 +239,11 @@ def _handoff_block(turns: list[dict], max_chars: int = 2000) -> str:
     if not tail:
         return ""
     return (
-        "\n\n--- WHAT WAS JUST SAID IN THE PREVIOUS SECTION (same conversation) ---\n"
+        "\n\n--- WHAT THE LEARNER SAID IN THE PREVIOUS SECTION (carry it forward) ---\n"
         + "\n".join(reversed(tail))
-        + "\nEverything the learner demonstrated above is settled. Build on it and never ask for it again."
+        + "\nEverything demonstrated above is settled — build on it, never ask for it again. "
+        "The previous section is CLOSED: do not say it is finished, do not mention any "
+        "button. Open by teaching THIS section."
     )
 
 
@@ -326,8 +333,19 @@ async def advance_section(
                 "isLast": sctx.is_last,
             },
         )
-        # 3. Only now speak, with the new section's instructions in place.
-        session.generate_reply()
+        # 3. Only now speak, with the new section's instructions in place. The
+        #    per-reply directive outweighs the tail of the chat history — the
+        #    last thing there is the OLD section's "tap the button" closing
+        #    line, and without this the model has opened the new section by
+        #    repeating it.
+        session.generate_reply(
+            instructions=(
+                "The learner just moved to the new section. In one sentence recap what "
+                "the previous section established, then teach this section's first key "
+                "point and ask one question. Do not say any section is finished and do "
+                "not mention any button."
+            )
+        )
 
 
 class TutorAgent(Agent):
