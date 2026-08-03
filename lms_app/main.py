@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -11,6 +12,8 @@ from sqlalchemy import text
 
 from .db import Base, SessionLocal, engine, ensure_schema
 from .routers import bootstrap, cohorts, documents, sessions, teams
+
+logger = logging.getLogger("praxos.startup")
 
 
 def _ensure_pgvector() -> None:
@@ -72,22 +75,55 @@ def _ensure_membership_schema() -> None:
             pass  # best-effort, idempotent self-heal
 
 
+def _bound_ddl_locks() -> None:
+    """Never let startup DDL wait on a lock.
+
+    Railway starts the new container while the old one is still serving, so the
+    ALTER TABLEs below race live reads. That deadlocked a deploy — Postgres
+    killed the DDL, the exception escaped the lifespan, and the container failed
+    to start at all. A short lock_timeout turns that into a fast, catchable error
+    instead of a deadlock, and the self-heal below is optional anyway."""
+    if engine.dialect.name != "postgresql":
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("SET lock_timeout = '3s'"))
+    except Exception:
+        pass
+
+
 def init_db() -> None:
-    """Create tables and seed demo data (idempotent). Alembic owns prod schema."""
-    ensure_schema()
-    _ensure_pgvector()
-    Base.metadata.create_all(bind=engine)
-    _ensure_columns()
-    _ensure_membership_schema()
+    """Bring the schema up to date, best-effort. Alembic owns the production schema.
+
+    Every step here is idempotent AND optional: on a deployed instance Alembic has
+    already applied the schema, and these calls only exist so a fresh or
+    pre-Alembic database still comes up. None of them may prevent the app from
+    starting — a container that cannot serve is strictly worse than one running
+    against a schema it did not manage to patch.
+    """
+    _bound_ddl_locks()
+    for step in (ensure_schema, _ensure_pgvector, _ensure_columns, _ensure_membership_schema):
+        try:
+            step()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("startup schema step %s skipped: %s", step.__name__, exc)
+    try:
+        Base.metadata.create_all(bind=engine)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("create_all skipped: %s", exc)
+
     # Backfill multi-workspace memberships from accepted invites (idempotent): people
     # who accepted before this change stop showing as pending and gain their membership.
     from . import workspace as workspace_svc
 
-    with SessionLocal() as db:
-        try:
-            workspace_svc.reconcile_memberships(db)
-        except Exception:
-            db.rollback()
+    try:
+        with SessionLocal() as db:
+            try:
+                workspace_svc.reconcile_memberships(db)
+            except Exception:
+                db.rollback()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("membership reconcile skipped: %s", exc)
 
 
 @asynccontextmanager
