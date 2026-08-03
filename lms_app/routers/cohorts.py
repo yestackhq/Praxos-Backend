@@ -201,7 +201,7 @@ def publish_cohort(
             )
             # Re-open only a COMPLETED document, and only on a fresh publish — so in-progress work
             # and routine re-publishes are never wiped.
-            reopen = fresh and item is not None and item.status == "mastered"
+            reopen = fresh and item is not None and item.status in scoring.DONE_STATUSES
             _seed_path(db, uid, doc, reopen=reopen)
             _seed_progress(db, uid, did, reopen=reopen)
     c.published = True
@@ -245,11 +245,24 @@ def _seed_path(db: Session, user_id: int, doc: models.Document, reopen: bool = F
         )
     )
     item_status = "up_next" if (count == 0 or has_active is None) else "locked"
-    db.add(
-        models.LearningPathItem(
-            user_id=user_id, document_id=doc.id, idx=count, status=item_status
+    # Append after everything already on the path. This used to use `count`, which
+    # is only re-read per publish — so every document of a multi-document cohort
+    # was seeded with the SAME idx, and "the next document to unlock" became
+    # whichever row Postgres happened to return first.
+    last = db.scalar(
+        select(func.max(models.LearningPathItem.idx)).where(
+            models.LearningPathItem.user_id == user_id
         )
     )
+    db.add(
+        models.LearningPathItem(
+            user_id=user_id,
+            document_id=doc.id,
+            idx=0 if last is None else int(last) + 1,
+            status=item_status,
+        )
+    )
+    db.flush()  # so the next document in this same publish sees this one
 
 
 def _seed_progress(db: Session, user_id: int, document_id: int, reopen: bool = False) -> None:
@@ -403,7 +416,7 @@ def person_detail(uid: int, admin: models.User = Depends(_admin), db: Session = 
     path = db.scalars(
         select(models.LearningPathItem)
         .where(models.LearningPathItem.user_id == u.id)
-        .order_by(models.LearningPathItem.idx)
+        .order_by(models.LearningPathItem.idx, models.LearningPathItem.id)
     ).all()
 
     def _doc_name(did: int) -> str:

@@ -139,6 +139,31 @@ audited or re-graded. `sessions.transcript` now stores them, and
 `GET /api/people/{uid}/sessions/{sid}` returns the transcript with the
 per-key-point evidence behind the number.
 
+### 4e. The score was a turnstile, not a report
+
+Advancement used to be gated on the score, twice over: a learner returned to the
+first section below the mastery threshold, and the next document opened only when
+a document *cleared* that threshold. Both are now gated on **work done**, not on
+how the grader felt about it.
+
+```
+next section     the first section not yet SAT
+next document    every section SAT   (status "completed", or "mastered" if the
+                                      document score also clears the threshold)
+```
+
+The grader has repeatedly landed in the low 60s on long, engaged conversations —
+62, 64, 65, 68 on sittings of 19 to 64 answers. Under the old rule those learners
+were held on the same document indefinitely, with no visible reason and no route
+forward except a threshold they were never shown. A threshold nobody can see is
+not a standard; it is a wall.
+
+Nothing is waved through. `MASTERY_THRESHOLD` still decides the `mastered` label,
+still drives the per-document and per-learner numbers an admin reads, and weak
+sections still drag the document score down honestly. A learner can redo any
+section deliberately (`restart`) to raise it. What changed is that the number
+reports on the learner instead of imprisoning them.
+
 ## 5. What was done to the live data
 
 Applied to `praxos_lms` (migration `e3a91c7b40d5`, full `pg_dump` taken first).

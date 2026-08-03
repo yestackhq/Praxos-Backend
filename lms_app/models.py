@@ -231,7 +231,10 @@ class LearningPathItem(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     document_id: Mapped[int] = mapped_column(ForeignKey("documents.id"))
     idx: Mapped[int] = mapped_column(Integer, default=0)
-    status: Mapped[str] = mapped_column(String(40), default="locked")  # mastered|in_progress|up_next|locked
+    # mastered|completed|in_progress|up_next|locked
+    # "completed" = every section sat; "mastered" = that, and the document score
+    # cleared the threshold. Both open the next document — see scoring.refresh_path_item.
+    status: Mapped[str] = mapped_column(String(40), default="locked")
 
 
 class Invite(Base):

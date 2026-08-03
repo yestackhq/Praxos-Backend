@@ -146,7 +146,7 @@ def start_session(
                 models.LearningPathItem.document_id == doc.id,
             )
         )
-        if item is not None and item.status == "mastered":
+        if item is not None and item.status in scoring.DONE_STATUSES:
             item.status = "in_progress"
         db.flush()
         idx = 0

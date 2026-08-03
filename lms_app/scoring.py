@@ -279,20 +279,32 @@ def apply_session(
     return session_row
 
 
+#: Path statuses that mean "the learner is finished with this document" — they
+#: have sat every section. ``mastered`` additionally means they scored well.
+DONE_STATUSES = ("completed", "mastered")
+
+
 def refresh_path_item(db: Session, *, user_id: int, document_id: int, total_sections: int) -> None:
     """Recompute this document's standing on the learner's path, and unlock the
-    next document once it is genuinely mastered.
+    next document once the learner has finished this one.
 
-    Mastery means: every section has been SAT, and the document score — the
-    minutes-weighted mean across all of them — clears the threshold.
+    FINISHED means every section has been sat. That — and only that — is what
+    opens the next document. Score does not gate the path: a learner who has
+    worked through all of a document is entitled to move on to the next one,
+    whatever the grader made of their answers.
 
-    It used to additionally require every section to individually clear the
-    threshold, which made the weighted mean redundant and the gate far harsher
-    than intended. A learner scoring 92, 65 and 75 averages 77 and has plainly
-    understood the document, but one section five points short kept them off the
-    next one indefinitely. The weak section still drags the document score down
-    honestly, and is still visible per-section to an admin — it just no longer
-    acts as a veto."""
+    MASTERED is the stricter reading — finished, and the document score (the
+    minutes-weighted mean across all sections) clears the threshold. It is a
+    label on how well they did, reported to them and to their admin. It is not a
+    turnstile.
+
+    Both of those used to be the same thing, and the gate compounded badly. The
+    grader has repeatedly landed in the low 60s on long, engaged conversations,
+    so learners who had genuinely worked through a document were held at it
+    indefinitely by a threshold they had no way to see or argue with. A learner
+    can still deliberately redo a section (``restart``) to raise their score,
+    and the weak sections stay visible per-section to an admin — but nothing
+    about a score can now strand someone on a document they have finished."""
     item = db.scalar(
         select(models.LearningPathItem).where(
             models.LearningPathItem.user_id == user_id,
@@ -302,27 +314,35 @@ def refresh_path_item(db: Session, *, user_id: int, document_id: int, total_sect
     if item is None:
         return
     understanding = document_understanding(db, user_id, document_id)
-    all_sections_sat = total_sections > 0 and len(
-        attempted_sections(db, user_id, document_id)
-    ) >= total_sections
+    sat = attempted_sections(db, user_id, document_id)
+    all_sections_sat = total_sections > 0 and len(sat) >= total_sections
 
-    if (
-        all_sections_sat
-        and understanding is not None
-        and understanding >= settings.MASTERY_THRESHOLD
-    ):
-        item.status = "mastered"
+    if all_sections_sat:
+        item.status = (
+            "mastered"
+            if understanding is not None and understanding >= settings.MASTERY_THRESHOLD
+            else "completed"
+        )
         nxt = db.scalar(
             select(models.LearningPathItem)
             .where(
                 models.LearningPathItem.user_id == user_id,
                 models.LearningPathItem.status == "locked",
             )
-            .order_by(models.LearningPathItem.idx)
+            # id breaks ties: legacy paths were seeded with duplicate idx values,
+            # and rows were inserted in curriculum order, so id is the honest
+            # fallback for "which document comes next".
+            .order_by(models.LearningPathItem.idx, models.LearningPathItem.id)
         )
         if nxt is not None:
             nxt.status = "up_next"
-    elif item.status != "mastered":
+    elif sat and item.status not in DONE_STATUSES:
+        # ``sat`` matters: this branch used to fire unconditionally, so calling
+        # this for a document the learner has never touched marked it in_progress
+        # — turning a locked document into an open one. Nothing hit that in the
+        # live path (it is only ever called for the section just sat), but it
+        # made recomputing a whole path unsafe, which is exactly what a rule
+        # change needs to do.
         item.status = "in_progress"
 
 

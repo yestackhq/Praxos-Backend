@@ -358,6 +358,83 @@ def test_one_weak_section_does_not_veto_a_document(client):
         assert items[nxt.id] == "up_next"
 
 
+def test_finishing_every_section_opens_the_next_document_whatever_the_score(client):
+    """Working through a document is what unlocks the next one. The score says how
+    well it went; it does not decide whether the learner may move on.
+
+    Scores of 62, 55 and 48 average 55 — well short of mastery — but the learner
+    has sat every section of the document. Holding them there means their only
+    route forward is a grader they cannot see or argue with, on a threshold they
+    were never shown."""
+    with SessionLocal() as db:
+        ws, u, doc = _fixture(db, name="Onward", minutes=[5, 5, 5])
+        nxt = models.Document(workspace_id=ws.id, name="Onward Next", chunk_count=1)
+        db.add(nxt)
+        db.flush()
+        db.add(models.Module(document_id=nxt.id, idx=0, title="N", minutes=5))
+        db.add_all([
+            models.LearningPathItem(user_id=u.id, document_id=doc.id, idx=0, status="in_progress"),
+            models.LearningPathItem(user_id=u.id, document_id=nxt.id, idx=1, status="locked"),
+        ])
+        for idx, score in ((0, 62), (1, 55), (2, 48)):
+            db.add(models.SectionProgress(user_id=u.id, document_id=doc.id, module_idx=idx,
+                                          best_score=score, last_score=score, attempts=1))
+        db.commit()
+
+        assert scoring.document_understanding(db, u.id, doc.id) == 55
+        scoring.refresh_path_item(db, user_id=u.id, document_id=doc.id, total_sections=3)
+        db.commit()
+
+        items = {i.document_id: i.status for i in db.query(models.LearningPathItem).all()}
+        assert items[doc.id] == "completed", "finished, but not mastered — and that is said plainly"
+        assert items[nxt.id] == "up_next", "the next document must open regardless of score"
+
+
+def test_a_finished_document_still_reports_mastery_honestly(client):
+    """Unlocking the next document must not quietly relabel a weak pass as mastery.
+    The learner moves on; the number still tells the truth about how it went."""
+    with SessionLocal() as db:
+        _, u, doc = _fixture(db, name="Honest", minutes=[5, 5])
+        db.add(models.LearningPathItem(user_id=u.id, document_id=doc.id, idx=0, status="in_progress"))
+        for idx, score in ((0, 50), (1, 40)):
+            db.add(models.SectionProgress(user_id=u.id, document_id=doc.id, module_idx=idx,
+                                          best_score=score, last_score=score, attempts=1))
+        db.commit()
+        scoring.refresh_path_item(db, user_id=u.id, document_id=doc.id, total_sections=2)
+        db.commit()
+
+        item = db.query(models.LearningPathItem).filter_by(user_id=u.id, document_id=doc.id).one()
+        assert item.status == "completed"
+        assert scoring.document_understanding(db, u.id, doc.id) == 45
+        assert scoring.band(45) == "Progressing", "not dressed up as a pass"
+        assert scoring.document_completion(db, u.id, doc.id) == 0, "no section reached mastery"
+
+
+def test_recomputing_a_path_does_not_open_documents_the_learner_never_touched(client):
+    """refresh_path_item must be safe to call for any document, not just the one
+    the learner just sat. It used to mark every non-finished document in_progress,
+    so recomputing a whole path unlocked everything at once."""
+    with SessionLocal() as db:
+        ws, u, doc = _fixture(db, name="Untouched", minutes=[5])
+        later = models.Document(workspace_id=ws.id, name="Untouched Later", chunk_count=1)
+        db.add(later)
+        db.flush()
+        db.add(models.Module(document_id=later.id, idx=0, title="L", minutes=5))
+        db.add_all([
+            models.LearningPathItem(user_id=u.id, document_id=doc.id, idx=0, status="up_next"),
+            models.LearningPathItem(user_id=u.id, document_id=later.id, idx=1, status="locked"),
+        ])
+        db.commit()
+
+        for d in (doc, later):
+            scoring.refresh_path_item(db, user_id=u.id, document_id=d.id, total_sections=1)
+        db.commit()
+
+        items = {i.document_id: i.status for i in db.query(models.LearningPathItem).all()}
+        assert items[doc.id] == "up_next", "not started is not in progress"
+        assert items[later.id] == "locked", "a locked document must stay locked"
+
+
 def test_a_document_is_not_mastered_with_a_section_never_sat(client):
     """The other half: strong scores on two of three sections must NOT unlock the
     next document while a section is untouched."""

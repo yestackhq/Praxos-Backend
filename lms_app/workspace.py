@@ -489,7 +489,7 @@ def _path_items(db: Session, user_id: int) -> list[models.LearningPathItem]:
         db.scalars(
             select(models.LearningPathItem)
             .where(models.LearningPathItem.user_id == user_id)
-            .order_by(models.LearningPathItem.idx)
+            .order_by(models.LearningPathItem.idx, models.LearningPathItem.id)
         ).all()
     )
 
@@ -545,6 +545,8 @@ def _my_documents(db: Session, user: models.User) -> list[dict]:
                 "status": (
                     "Mastered"
                     if i.status == "mastered"
+                    else "Completed"
+                    if i.status == "completed"
                     else "Locked"
                     if i.status == "locked"
                     else "Assigned"
@@ -589,7 +591,7 @@ def _continue_learning(db: Session, user: models.User, idx: "scoring.ScoreIndex"
             models.LearningPathItem.user_id == user.id,
             models.LearningPathItem.status.in_(["in_progress", "up_next"]),
         )
-        .order_by(models.LearningPathItem.idx)
+        .order_by(models.LearningPathItem.idx, models.LearningPathItem.id)
     )
     if item is None:
         return None
@@ -613,7 +615,9 @@ def _continue_learning(db: Session, user: models.User, idx: "scoring.ScoreIndex"
 
 def _learner_stats(db: Session, user: models.User) -> dict:
     items = _path_items(db, user.id)
-    mastered = sum(1 for i in items if i.status == "mastered")
+    # How far along their path they are — documents finished, not documents
+    # scored above the bar. Mastery is reported separately, per document.
+    mastered = sum(1 for i in items if i.status in scoring.DONE_STATUSES)
     sessions = (
         db.scalar(
             select(func.count())
@@ -667,12 +671,14 @@ def _kpis(db: Session, ws_id: int, idx: "scoring.ScoreIndex") -> list[dict]:
         if users
         else []
     )
-    mastered = sum(1 for i in items if i.status == "mastered")
-    completion = round(100 * mastered / len(items)) if items else 0
+    # Completion counts documents FINISHED; "Mastery rate" below counts the
+    # stricter thing. Reporting one number for both hid which was which.
+    finished = sum(1 for i in items if i.status in scoring.DONE_STATUSES)
+    completion = round(100 * finished / len(items)) if items else 0
     return [
         {"label": "Avg understanding", "value": str(avg), "hint": "demonstrated, not guessed"},
         {"label": "Active learners", "value": str(len(measured)), "hint": f"of {len(users)} in workspace"},
-        {"label": "Completion", "value": f"{completion}%", "hint": "documents mastered"},
+        {"label": "Completion", "value": f"{completion}%", "hint": "documents completed"},
         {"label": "At risk", "value": str(at_risk), "hint": f"below {settings.AT_RISK_THRESHOLD}"},
         {"label": "Sessions today", "value": str(scoring.sessions_today(db, ws_id)), "hint": ""},
     ]

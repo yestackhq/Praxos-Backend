@@ -76,3 +76,59 @@ def test_fresh_publish_reopens_completed_doc(client):
         assert item.status == "mastered", "re-publish must be non-destructive"
     finally:
         db.close()
+
+
+def test_publishing_a_multi_document_cohort_orders_the_path(client):
+    """Each document must land at its own position on the path, in curriculum
+    order. They all used to be seeded with the same idx, so "which document
+    unlocks next" came down to whatever order the database returned."""
+    db = SessionLocal()
+    try:
+        ws = models.Workspace(name="Order WS", slug="order-ws")
+        db.add(ws)
+        db.flush()
+        admin = models.User(
+            workspace_id=ws.id, name="Admin", email="a@ord.test", role="Admin", clerk_id="ck_ord_a"
+        )
+        learner = models.User(
+            workspace_id=ws.id, name="Learner", email="l@ord.test", role="Learner", clerk_id="ck_ord_l"
+        )
+        db.add_all([admin, learner])
+        db.flush()
+
+        c = models.Cohort(workspace_id=ws.id, name="Ordered Cohort", published=False)
+        db.add(c)
+        db.flush()
+        db.add(models.CohortMember(cohort_id=c.id, user_id=learner.id))
+        doc_ids = []
+        for n in range(3):
+            doc = models.Document(
+                workspace_id=ws.id, name=f"Chapter {n + 1}", chunk_count=1, status="Indexed"
+            )
+            db.add(doc)
+            db.flush()
+            db.add(
+                models.Module(
+                    document_id=doc.id, idx=0, title="S0", description="", topics=[],
+                    minutes=5, chunk_start=0, chunk_end=1,
+                )
+            )
+            db.add(models.CohortDocument(cohort_id=c.id, document_id=doc.id, idx=n))
+            doc_ids.append(doc.id)
+        db.commit()
+
+        cohorts.publish_cohort(c.id, user=admin, db=db)
+
+        items = (
+            db.query(models.LearningPathItem)
+            .filter_by(user_id=learner.id)
+            .order_by(models.LearningPathItem.idx)
+            .all()
+        )
+        assert [i.idx for i in items] == [0, 1, 2], "every document gets its own position"
+        assert [i.document_id for i in items] == doc_ids, "in curriculum order"
+        assert [i.status for i in items] == ["up_next", "locked", "locked"], (
+            "only the first is open; the rest unlock as the learner finishes"
+        )
+    finally:
+        db.close()
