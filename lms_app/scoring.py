@@ -313,6 +313,13 @@ def refresh_path_item(db: Session, *, user_id: int, document_id: int, total_sect
     can still deliberately redo a section (``restart``) to raise their score,
     and the weak sections stay visible per-section to an admin — but nothing
     about a score can now strand someone on a document they have finished."""
+    # The app session runs with autoflush=False, and apply_session calls this
+    # with the sitting it just recorded still PENDING in memory. Everything
+    # below reads via SQL predicates, which only see flushed state — without
+    # this, the final section's attempt is invisible to attempted_sections,
+    # "all sections sat" never comes true on the grading that completes the
+    # document, and the next document never unlocks.
+    db.flush()
     item = db.scalar(
         select(models.LearningPathItem).where(
             models.LearningPathItem.user_id == user_id,
