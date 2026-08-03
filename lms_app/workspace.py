@@ -518,7 +518,10 @@ def _learning_path(db: Session, user: models.User, idx: "scoring.ScoreIndex") ->
                 "sections": sections.get(i.document_id, 0),
                 "status": i.status,
                 # % of the document taken to mastery, and how much is demonstrated.
-                "progress": idx.document_completion(user.id, i.document_id),
+                # How far THROUGH the document, not how much is mastered — see
+                # scoring.document_progress.
+                "progress": idx.document_progress(user.id, i.document_id),
+                "mastered": idx.document_completion(user.id, i.document_id),
                 "understanding": idx.document_understanding(user.id, i.document_id),
             }
         )
@@ -596,13 +599,15 @@ def _continue_learning(db: Session, user: models.User, idx: "scoring.ScoreIndex"
     total = _section_count(db, doc.id)
     cur = scoring.next_section_idx(db, user.id, doc.id, total) + 1
     completion = idx.document_completion(user.id, doc.id)
+    progress = idx.document_progress(user.id, doc.id)
     return {
         "docId": doc.id,
         "doc": clean_name(doc.name),
         "position": f"Section {min(cur, total)} of {total}" if total else "Ready to start",
-        "remaining": "Pick up where you left off." if completion else "Start your first section.",
+        "remaining": "Pick up where you left off." if progress else "Start your first section.",
         "understanding": idx.document_understanding(user.id, doc.id),
-        "progress": completion,
+        "progress": progress,
+        "mastered": completion,
     }
 
 

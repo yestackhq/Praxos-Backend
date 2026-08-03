@@ -290,3 +290,39 @@ def test_resume_returns_to_the_first_unsat_section(client):
                                       best_score=80, last_score=80, attempts=1))
         db.commit()
         assert scoring.next_section_idx(db, u.id, doc.id, 3) == 1
+
+
+def test_progress_reflects_sections_sat_not_sections_mastered(client):
+    """A learner who had sat two of three sections was shown 0% progress, because
+    the bar was driven by the MASTERY count. That reads as 'none of that
+    counted'. Progress says where you are; mastery still gates advancement."""
+    with SessionLocal() as db:
+        _, u, doc = _fixture(db, name="Progress", minutes=[5, 6, 4])
+        db.add_all([
+            models.SectionProgress(user_id=u.id, document_id=doc.id, module_idx=0,
+                                   best_score=68, last_score=68, attempts=2),
+            models.SectionProgress(user_id=u.id, document_id=doc.id, module_idx=1,
+                                   best_score=62, last_score=62, attempts=1),
+        ])
+        db.commit()
+
+        assert scoring.document_progress(db, u.id, doc.id) == 67, "two of three sections sat"
+        assert scoring.document_completion(db, u.id, doc.id) == 0, "neither reached mastery"
+        # The understanding figure is unchanged and still weighted by minutes.
+        assert scoring.document_understanding(db, u.id, doc.id) == 47
+
+        idx = scoring.ScoreIndex(db, doc.workspace_id)
+        assert idx.document_progress(u.id, doc.id) == scoring.document_progress(db, u.id, doc.id)
+        assert idx.document_completion(u.id, doc.id) == scoring.document_completion(db, u.id, doc.id)
+
+
+def test_a_sat_but_unscored_section_still_counts_as_progress(client):
+    """Sitting a section and saying too little to be graded is still progress
+    through the document, even though it earns no score."""
+    with SessionLocal() as db:
+        _, u, doc = _fixture(db, name="Unscored", minutes=[5, 5])
+        db.add(models.SectionProgress(user_id=u.id, document_id=doc.id, module_idx=0,
+                                      best_score=None, last_score=None, attempts=1))
+        db.commit()
+        assert scoring.document_progress(db, u.id, doc.id) == 50
+        assert scoring.document_understanding(db, u.id, doc.id) is None

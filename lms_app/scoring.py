@@ -99,6 +99,22 @@ def document_completion(db: Session, user_id: int, document_id: int) -> int:
     return _completion_from(section_bests(db, user_id, document_id), _plan_weights(db, document_id))
 
 
+def document_progress(db: Session, user_id: int, document_id: int) -> int:
+    """How far THROUGH the document the learner is: sections sat / total (0-100).
+
+    Deliberately distinct from ``document_completion``, which counts only
+    sections taken to mastery. Showing the mastery figure as a learner's
+    "progress" told someone who had sat two of three sections that they were 0%
+    through — which reads as "none of that counted" and is the opposite of what
+    a progress bar is for. Mastery still gates advancement; progress just says
+    where they are."""
+    weights = _plan_weights(db, document_id)
+    if not weights:
+        return 0
+    sat = len(attempted_sections(db, user_id, document_id) & set(weights))
+    return round(100 * sat / len(weights))
+
+
 def started_document_ids(db: Session, user_id: int) -> list[int]:
     """Documents the learner has at least one scored section on."""
     return [
@@ -374,6 +390,8 @@ class ScoreIndex:
         self._weights: dict[int, dict[int, int]] = {}
         self._bests: dict[tuple[int, int], dict[int, int]] = {}
         self._started: dict[int, set[int]] = {}
+        # Sat, whether or not it produced a score — progress is not mastery.
+        self._attempted: dict[tuple[int, int], set[int]] = {}
 
         doc_ids = [
             int(d)
@@ -397,17 +415,19 @@ class ScoreIndex:
                 self._weights.setdefault(int(did), {})[int(idx)] = max(1, int(mins or 1))
 
         if user_ids:
-            for uid, did, idx, best in db.execute(
+            for uid, did, idx, best, attempts in db.execute(
                 select(
                     models.SectionProgress.user_id,
                     models.SectionProgress.document_id,
                     models.SectionProgress.module_idx,
                     models.SectionProgress.best_score,
-                ).where(
-                    models.SectionProgress.user_id.in_(user_ids),
-                    models.SectionProgress.best_score.is_not(None),
-                )
+                    models.SectionProgress.attempts,
+                ).where(models.SectionProgress.user_id.in_(user_ids))
             ).all():
+                if (attempts or 0) > 0:
+                    self._attempted.setdefault((int(uid), int(did)), set()).add(int(idx))
+                if best is None:
+                    continue
                 self._bests.setdefault((int(uid), int(did)), {})[int(idx)] = int(best)
                 self._started.setdefault(int(uid), set()).add(int(did))
 
@@ -431,6 +451,14 @@ class ScoreIndex:
         return _completion_from(
             self.section_bests(user_id, document_id), self.plan_weights(document_id)
         )
+
+    def document_progress(self, user_id: int, document_id: int) -> int:
+        """Sections sat / total. See scoring.document_progress."""
+        weights = self.plan_weights(document_id)
+        if not weights:
+            return 0
+        sat = len(self._attempted.get((user_id, document_id), set()) & set(weights))
+        return round(100 * sat / len(weights))
 
     def user_understanding(
         self, user_id: int, document_ids: Optional[Iterable[int]] = None
