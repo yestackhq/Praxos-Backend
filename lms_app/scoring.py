@@ -281,7 +281,18 @@ def apply_session(
 
 def refresh_path_item(db: Session, *, user_id: int, document_id: int, total_sections: int) -> None:
     """Recompute this document's standing on the learner's path, and unlock the
-    next document once it is genuinely mastered."""
+    next document once it is genuinely mastered.
+
+    Mastery means: every section has been SAT, and the document score — the
+    minutes-weighted mean across all of them — clears the threshold.
+
+    It used to additionally require every section to individually clear the
+    threshold, which made the weighted mean redundant and the gate far harsher
+    than intended. A learner scoring 92, 65 and 75 averages 77 and has plainly
+    understood the document, but one section five points short kept them off the
+    next one indefinitely. The weak section still drags the document score down
+    honestly, and is still visible per-section to an admin — it just no longer
+    acts as a veto."""
     item = db.scalar(
         select(models.LearningPathItem).where(
             models.LearningPathItem.user_id == user_id,
@@ -290,12 +301,13 @@ def refresh_path_item(db: Session, *, user_id: int, document_id: int, total_sect
     )
     if item is None:
         return
-    completion = document_completion(db, user_id, document_id)
     understanding = document_understanding(db, user_id, document_id)
+    all_sections_sat = total_sections > 0 and len(
+        attempted_sections(db, user_id, document_id)
+    ) >= total_sections
 
     if (
-        total_sections
-        and completion >= 100
+        all_sections_sat
         and understanding is not None
         and understanding >= settings.MASTERY_THRESHOLD
     ):
@@ -315,14 +327,22 @@ def refresh_path_item(db: Session, *, user_id: int, document_id: int, total_sect
 
 
 def attempted_sections(db: Session, user_id: int, document_id: int) -> set[int]:
-    """Sections the learner has actually sat, scored or not."""
+    """Sections the learner has actually sat, scored or not.
+
+    A section counts as sat if it has an attempt OR a score. Those cannot
+    disagree in data written by apply_session, but they can in rows written any
+    other way — the schema migration rebuilt progress rows with attempts=0, and
+    a seeded row need not set both. Keying mastery on attempts alone would then
+    quietly refuse to unlock the next document for a learner whose scores are
+    plainly there."""
     return {
         int(i)
         for i in db.scalars(
             select(models.SectionProgress.module_idx).where(
                 models.SectionProgress.user_id == user_id,
                 models.SectionProgress.document_id == document_id,
-                models.SectionProgress.attempts > 0,
+                (models.SectionProgress.attempts > 0)
+                | (models.SectionProgress.best_score.is_not(None)),
             )
         ).all()
     }
@@ -424,7 +444,7 @@ class ScoreIndex:
                     models.SectionProgress.attempts,
                 ).where(models.SectionProgress.user_id.in_(user_ids))
             ).all():
-                if (attempts or 0) > 0:
+                if (attempts or 0) > 0 or best is not None:
                     self._attempted.setdefault((int(uid), int(did)), set()).add(int(idx))
                 if best is None:
                     continue

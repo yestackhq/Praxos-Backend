@@ -326,3 +326,49 @@ def test_a_sat_but_unscored_section_still_counts_as_progress(client):
         db.commit()
         assert scoring.document_progress(db, u.id, doc.id) == 50
         assert scoring.document_understanding(db, u.id, doc.id) is None
+
+
+def test_one_weak_section_does_not_veto_a_document(client):
+    """Mastery gates on the document score, not on every section clearing the bar
+    individually. A learner scoring 92, 65 and 75 averages 77 — they have plainly
+    understood it, and one section five points short used to keep them off the
+    next document forever."""
+    with SessionLocal() as db:
+        ws, u, doc = _fixture(db, name="Veto", minutes=[5, 5, 5])
+        nxt = models.Document(workspace_id=ws.id, name="Veto Next", chunk_count=1)
+        db.add(nxt)
+        db.flush()
+        db.add(models.Module(document_id=nxt.id, idx=0, title="N", minutes=5))
+        db.add_all([
+            models.LearningPathItem(user_id=u.id, document_id=doc.id, idx=0, status="in_progress"),
+            models.LearningPathItem(user_id=u.id, document_id=nxt.id, idx=1, status="locked"),
+        ])
+        for idx, score in ((0, 92), (1, 65), (2, 75)):
+            db.add(models.SectionProgress(user_id=u.id, document_id=doc.id, module_idx=idx,
+                                          best_score=score, last_score=score, attempts=1))
+        db.commit()
+
+        assert scoring.document_understanding(db, u.id, doc.id) == 77
+        assert scoring.document_completion(db, u.id, doc.id) == 67, "one section below the bar"
+
+        scoring.refresh_path_item(db, user_id=u.id, document_id=doc.id, total_sections=3)
+        db.commit()
+        items = {i.document_id: i.status for i in db.query(models.LearningPathItem).all()}
+        assert items[doc.id] == "mastered"
+        assert items[nxt.id] == "up_next"
+
+
+def test_a_document_is_not_mastered_with_a_section_never_sat(client):
+    """The other half: strong scores on two of three sections must NOT unlock the
+    next document while a section is untouched."""
+    with SessionLocal() as db:
+        ws, u, doc = _fixture(db, name="Unsat", minutes=[5, 5, 5])
+        db.add(models.LearningPathItem(user_id=u.id, document_id=doc.id, idx=0, status="in_progress"))
+        for idx, score in ((0, 95), (1, 95)):
+            db.add(models.SectionProgress(user_id=u.id, document_id=doc.id, module_idx=idx,
+                                          best_score=score, last_score=score, attempts=1))
+        db.commit()
+        scoring.refresh_path_item(db, user_id=u.id, document_id=doc.id, total_sections=3)
+        db.commit()
+        item = db.query(models.LearningPathItem).filter_by(user_id=u.id, document_id=doc.id).one()
+        assert item.status == "in_progress"
