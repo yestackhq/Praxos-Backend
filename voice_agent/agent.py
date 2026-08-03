@@ -36,7 +36,16 @@ from typing import Any, Optional
 
 import httpx
 from livekit import agents, rtc
-from livekit.agents import Agent, AgentSession, JobContext, RoomInputOptions, WorkerOptions, cli
+from livekit.agents import (
+    APIConnectOptions,
+    Agent,
+    AgentSession,
+    JobContext,
+    RoomInputOptions,
+    WorkerOptions,
+    cli,
+)
+from livekit.agents.voice.agent_session import SessionConnectOptions
 from livekit.agents.llm import function_tool
 from livekit.plugins import cartesia, deepgram, openai, silero
 
@@ -404,7 +413,19 @@ async def entrypoint(ctx: JobContext):
     stt_cfg = bootstrap.get("stt") or {}
     tts_cfg = bootstrap.get("tts") or {}
 
+    # The gateway intermittently answers 502 UPSTREAM_UNAVAILABLE. The defaults
+    # here are tuned for a fast chat model: three tries at 0.1s/2s/2s, and a 10s
+    # connect timeout that a reasoning model routinely exceeds on a long turn.
+    # Both were making the tutor fall silent mid-lesson. Widen the window rather
+    # than let a transient upstream blip end the conversation.
+    conn = SessionConnectOptions(
+        llm_conn_options=APIConnectOptions(max_retry=5, retry_interval=2.0, timeout=90.0),
+        tts_conn_options=APIConnectOptions(max_retry=4, retry_interval=1.0, timeout=30.0),
+        stt_conn_options=APIConnectOptions(max_retry=4, retry_interval=1.0, timeout=30.0),
+    )
+
     session: AgentSession = AgentSession(
+        conn_options=conn,
         stt=deepgram.STT(
             model=stt_cfg.get("model", "nova-3"),
             language=stt_cfg.get("language", "multi"),

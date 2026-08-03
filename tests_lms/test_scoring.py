@@ -188,3 +188,66 @@ def test_completing_the_last_section_unlocks_the_next_document(client):
         assert items[nxt.id] == "up_next", "the next document must open"
         assert scoring.document_completion(db, u.id, doc.id) == 100
         assert scoring.document_understanding(db, u.id, doc.id) >= settings.MASTERY_THRESHOLD
+
+
+def test_score_index_agrees_exactly_with_the_per_call_functions(client):
+    """The batched read model must be a change in HOW inputs are fetched, never
+    in what the numbers mean. Any drift here silently rewrites everyone's score."""
+    with SessionLocal() as db:
+        ws, u1, doc_a = _fixture(db, name="Agree", minutes=[5, 6, 4])
+        u2 = models.User(clerk_id="agree_u2", workspace_id=ws.id, name="Second",
+                         email="s@agree.dev", role="Learner")
+        doc_b = models.Document(workspace_id=ws.id, name="Agree B", chunk_count=2)
+        db.add_all([u2, doc_b])
+        db.flush()
+        for i, m in enumerate([7, 3]):
+            db.add(models.Module(document_id=doc_b.id, idx=i, title=f"B{i}", minutes=m))
+        # A deliberately uneven spread: partial, complete, untouched, zero.
+        _progress(db, u1, doc_a, 0, 90)
+        _progress(db, u1, doc_a, 2, 55)
+        _progress(db, u1, doc_b, 0, 71)
+        _progress(db, u2, doc_a, 1, 100)
+        db.commit()
+
+        idx = scoring.ScoreIndex(db, ws.id)
+        for u in (u1, u2):
+            assert idx.started_document_ids(u.id) == scoring.started_document_ids(db, u.id)
+            assert idx.user_understanding(u.id) == scoring.user_understanding(db, u.id)
+            for doc in (doc_a, doc_b):
+                assert idx.section_bests(u.id, doc.id) == scoring.section_bests(db, u.id, doc.id)
+                assert idx.document_understanding(u.id, doc.id) == scoring.document_understanding(
+                    db, u.id, doc.id
+                )
+                assert idx.document_completion(u.id, doc.id) == scoring.document_completion(
+                    db, u.id, doc.id
+                )
+            # Scoped to a subset of documents, as cohort figures are.
+            assert idx.user_understanding(u.id, [doc_a.id]) == scoring.user_understanding(
+                db, u.id, [doc_a.id]
+            )
+
+
+def test_score_index_matches_cohort_and_team_rollups(client):
+    with SessionLocal() as db:
+        ws, u, doc = _fixture(db, name="Roll", minutes=[5, 5])
+        _progress(db, u, doc, 0, 80)
+        c = models.Cohort(workspace_id=ws.id, name="RollCohort")
+        t = models.Team(workspace_id=ws.id, name="RollTeam")
+        db.add_all([c, t])
+        db.flush()
+        db.add_all([
+            models.CohortDocument(cohort_id=c.id, document_id=doc.id, idx=0),
+            models.CohortMember(cohort_id=c.id, user_id=u.id),
+            models.TeamDocument(team_id=t.id, document_id=doc.id, idx=0),
+            models.TeamMember(team_id=t.id, user_id=u.id),
+        ])
+        db.commit()
+
+        idx = scoring.ScoreIndex(db, ws.id)
+        assert idx.group_understanding(
+            scoring.cohort_member_ids(db, c.id), scoring.cohort_document_ids(db, c.id)
+        ) == scoring.cohort_understanding(db, c.id)
+        assert idx.group_completion(
+            scoring.cohort_member_ids(db, c.id), scoring.cohort_document_ids(db, c.id)
+        ) == scoring.cohort_completion(db, c.id)
+        assert idx.group_understanding([u.id], [doc.id]) == scoring.team_understanding(db, t.id)

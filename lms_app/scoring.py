@@ -47,6 +47,18 @@ def band(score: Optional[int]) -> str:
 # ---- plan shape --------------------------------------------------------------
 
 
+def _completion_from(bests: dict[int, int], weights: dict[int, int]) -> int:
+    """Share of a document's sections taken to mastery. Pure."""
+    if not weights:
+        return 0
+    done = sum(1 for idx in weights if bests.get(idx, 0) >= settings.MASTERY_THRESHOLD)
+    return round(100 * done / len(weights))
+
+
+def _mean(values: list[int]) -> Optional[int]:
+    return round(sum(values) / len(values)) if values else None
+
+
 def _plan_weights(db: Session, document_id: int) -> dict[int, int]:
     """module_idx -> minutes. A document with no plan yet is treated as one
     section so a score is still expressible."""
@@ -84,12 +96,7 @@ def document_understanding(db: Session, user_id: int, document_id: int) -> Optio
 
 def document_completion(db: Session, user_id: int, document_id: int) -> int:
     """Share of the document's sections the learner has taken to mastery (0-100)."""
-    weights = _plan_weights(db, document_id)
-    if not weights:
-        return 0
-    bests = section_bests(db, user_id, document_id)
-    done = sum(1 for idx in weights if bests.get(idx, 0) >= settings.MASTERY_THRESHOLD)
-    return round(100 * done / len(weights))
+    return _completion_from(section_bests(db, user_id, document_id), _plan_weights(db, document_id))
 
 
 def started_document_ids(db: Session, user_id: int) -> list[int]:
@@ -117,7 +124,7 @@ def user_understanding(
     if document_ids is not None:
         started &= set(document_ids)
     scores = [s for s in (document_understanding(db, user_id, d) for d in sorted(started)) if s is not None]
-    return round(sum(scores) / len(scores)) if scores else None
+    return _mean(scores)
 
 
 def cohort_document_ids(db: Session, cohort_id: int) -> list[int]:
@@ -317,3 +324,115 @@ def sessions_today(db: Session, workspace_id: int) -> int:
         )
         or 0
     )
+
+
+# ---- batched read model ------------------------------------------------------
+
+
+class ScoreIndex:
+    """Every understanding number for one workspace, loaded in two queries.
+
+    ``build_bundle`` asks for the same figures over and over — each learner's
+    understanding is recomputed by the People table, the KPI row, the
+    at-risk list and every cohort. Answering those one at a time issued ~1700
+    queries per /api/bootstrap; against a remote database that is tens of seconds
+    of round trips, and the page failed rather than loaded.
+
+    The arithmetic is identical to the per-call functions above — both sides call
+    the same pure helpers — so this is purely a change in HOW the inputs are
+    fetched, not in what the numbers mean.
+    """
+
+    def __init__(self, db: Session, workspace_id: int):
+        self._weights: dict[int, dict[int, int]] = {}
+        self._bests: dict[tuple[int, int], dict[int, int]] = {}
+        self._started: dict[int, set[int]] = {}
+
+        doc_ids = [
+            int(d)
+            for d in db.scalars(
+                select(models.Document.id).where(models.Document.workspace_id == workspace_id)
+            ).all()
+        ]
+        user_ids = [
+            int(u)
+            for u in db.scalars(
+                select(models.User.id).where(models.User.workspace_id == workspace_id)
+            ).all()
+        ]
+
+        if doc_ids:
+            for did, idx, mins in db.execute(
+                select(models.Module.document_id, models.Module.idx, models.Module.minutes).where(
+                    models.Module.document_id.in_(doc_ids)
+                )
+            ).all():
+                self._weights.setdefault(int(did), {})[int(idx)] = max(1, int(mins or 1))
+
+        if user_ids:
+            for uid, did, idx, best in db.execute(
+                select(
+                    models.SectionProgress.user_id,
+                    models.SectionProgress.document_id,
+                    models.SectionProgress.module_idx,
+                    models.SectionProgress.best_score,
+                ).where(
+                    models.SectionProgress.user_id.in_(user_ids),
+                    models.SectionProgress.best_score.is_not(None),
+                )
+            ).all():
+                self._bests.setdefault((int(uid), int(did)), {})[int(idx)] = int(best)
+                self._started.setdefault(int(uid), set()).add(int(did))
+
+    # A document with no plan is treated as one section, matching _plan_weights.
+    def plan_weights(self, document_id: int) -> dict[int, int]:
+        return self._weights.get(document_id) or {0: 1}
+
+    def section_bests(self, user_id: int, document_id: int) -> dict[int, int]:
+        return self._bests.get((user_id, document_id), {})
+
+    def started_document_ids(self, user_id: int) -> list[int]:
+        return sorted(self._started.get(user_id, set()))
+
+    def document_understanding(self, user_id: int, document_id: int) -> Optional[int]:
+        bests = self.section_bests(user_id, document_id)
+        if not bests:
+            return None
+        return ai.document_score(bests, self.plan_weights(document_id))
+
+    def document_completion(self, user_id: int, document_id: int) -> int:
+        return _completion_from(
+            self.section_bests(user_id, document_id), self.plan_weights(document_id)
+        )
+
+    def user_understanding(
+        self, user_id: int, document_ids: Optional[Iterable[int]] = None
+    ) -> Optional[int]:
+        started = set(self.started_document_ids(user_id))
+        if document_ids is not None:
+            started &= set(document_ids)
+        return _mean(
+            [
+                s
+                for s in (self.document_understanding(user_id, d) for d in sorted(started))
+                if s is not None
+            ]
+        )
+
+    def group_understanding(
+        self, user_ids: Iterable[int], document_ids: Optional[Iterable[int]] = None
+    ) -> Optional[int]:
+        docs = list(document_ids) if document_ids is not None else None
+        return _mean(
+            [v for v in (self.user_understanding(u, docs) for u in user_ids) if v is not None]
+        )
+
+    def group_completion(self, user_ids: Iterable[int], document_ids: Iterable[int]) -> int:
+        docs = list(document_ids)
+        members = list(user_ids)
+        if not docs or not members:
+            return 0
+        per = [
+            sum(self.document_completion(u, d) for d in docs) / len(docs) for u in members
+        ]
+        return round(sum(per) / len(per))

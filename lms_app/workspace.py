@@ -270,13 +270,44 @@ def _assigned_count(db: Session, document_id: int) -> int:
     )
 
 
-def document_out(db: Session, d: models.Document) -> dict:
-    sections = int(
-        db.scalar(
-            select(func.count()).select_from(models.Module).where(models.Module.document_id == d.id)
+def _section_counts(db: Session, document_ids: list[int]) -> dict[int, int]:
+    """Sections per document, in one query rather than one per document."""
+    if not document_ids:
+        return {}
+    rows = db.execute(
+        select(models.Module.document_id, func.count())
+        .where(models.Module.document_id.in_(document_ids))
+        .group_by(models.Module.document_id)
+    ).all()
+    return {int(d): int(n) for d, n in rows}
+
+
+def _assigned_counts(db: Session, document_ids: list[int]) -> dict[int, int]:
+    if not document_ids:
+        return {}
+    rows = db.execute(
+        select(models.LearningPathItem.document_id, func.count())
+        .where(models.LearningPathItem.document_id.in_(document_ids))
+        .group_by(models.LearningPathItem.document_id)
+    ).all()
+    return {int(d): int(n) for d, n in rows}
+
+
+def document_out(
+    db: Session,
+    d: models.Document,
+    sections: Optional[int] = None,
+    assigned: Optional[int] = None,
+) -> dict:
+    """Counts may be supplied by the caller when rendering a whole list, so a
+    13-document workspace costs two queries rather than twenty-six."""
+    if sections is None:
+        sections = int(
+            db.scalar(
+                select(func.count()).select_from(models.Module).where(models.Module.document_id == d.id)
+            )
+            or 0
         )
-        or 0
-    )
     return {
         "id": d.id,
         "name": d.name,
@@ -285,7 +316,7 @@ def document_out(db: Session, d: models.Document) -> dict:
         # split. The old API returned the chunk count under the name "sections".
         "sections": sections,
         "chunks": d.chunk_count,
-        "assigned": _assigned_count(db, d.id),
+        "assigned": _assigned_count(db, d.id) if assigned is None else assigned,
         "status": d.status,
     }
 
@@ -296,10 +327,13 @@ def _documents(db: Session, ws_id: int) -> list[dict]:
         .where(models.Document.workspace_id == ws_id)
         .order_by(models.Document.id.desc())
     ).all()
-    return [document_out(db, d) for d in docs]
+    ids = [d.id for d in docs]
+    sections = _section_counts(db, ids)
+    assigned = _assigned_counts(db, ids)
+    return [document_out(db, d, sections.get(d.id, 0), assigned.get(d.id, 0)) for d in docs]
 
 
-def _people(db: Session, ws_id: int) -> list[dict]:
+def _people(db: Session, ws_id: int, idx: "scoring.ScoreIndex") -> list[dict]:
     users = db.scalars(
         select(models.User).where(models.User.workspace_id == ws_id).order_by(models.User.id)
     ).all()
@@ -307,7 +341,7 @@ def _people(db: Session, ws_id: int) -> list[dict]:
     cohort_of = _user_cohort_map(db, ws_id)
     out: list[dict] = []
     for u in users:
-        score = scoring.user_understanding(db, u.id)
+        score = idx.user_understanding(u.id)
         out.append(
             {
                 "id": u.id,
@@ -316,7 +350,7 @@ def _people(db: Session, ws_id: int) -> list[dict]:
                 "role": u.role,
                 "cohort": cohort_of.get(u.id, "—"),
                 "team": team_of.get(u.id, ""),
-                "documents": len(scoring.started_document_ids(db, u.id)),
+                "documents": len(idx.started_document_ids(u.id)),
                 # Demonstrated across every document they have started — not the
                 # score of whichever section happened to be graded most recently.
                 "understanding": score,
@@ -346,7 +380,7 @@ def _cohort_doc_ids(db: Session, cohort_id: int) -> list[int]:
     return scoring.cohort_document_ids(db, cohort_id)
 
 
-def cohort_detail(db: Session, c: models.Cohort) -> dict:
+def cohort_detail(db: Session, c: models.Cohort, idx=None) -> dict:
     member_ids = _cohort_member_ids(db, c.id)
     doc_ids = _cohort_doc_ids(db, c.id)
     docs = [
@@ -354,8 +388,10 @@ def cohort_detail(db: Session, c: models.Cohort) -> dict:
         for d in (db.get(models.Document, did) for did in doc_ids)
         if d is not None
     ]
-    cu = scoring.cohort_understanding(db, c.id)
-    completion = scoring.cohort_completion(db, c.id)
+    if idx is None:
+        idx = scoring.ScoreIndex(db, c.workspace_id)
+    cu = idx.group_understanding(member_ids, doc_ids) if doc_ids else None
+    completion = idx.group_completion(member_ids, doc_ids)
     return {
         "id": c.id,
         "name": c.name,
@@ -384,11 +420,11 @@ def _cohort_status(understanding: Optional[int], completion: int, published: boo
     return "On track"
 
 
-def _cohorts(db: Session, ws_id: int) -> list[dict]:
+def _cohorts(db: Session, ws_id: int, idx: "scoring.ScoreIndex") -> list[dict]:
     rows = db.scalars(
         select(models.Cohort).where(models.Cohort.workspace_id == ws_id).order_by(models.Cohort.id)
     ).all()
-    return [cohort_detail(db, c) for c in rows]
+    return [cohort_detail(db, c, idx) for c in rows]
 
 
 def _team_member_ids(db: Session, team_id: int) -> list[int]:
@@ -411,7 +447,7 @@ def _team_doc_ids(db: Session, team_id: int) -> list[int]:
     ]
 
 
-def team_detail(db: Session, t: models.Team) -> dict:
+def team_detail(db: Session, t: models.Team, idx=None) -> dict:
     member_ids = _team_member_ids(db, t.id)
     doc_ids = _team_doc_ids(db, t.id)
     docs = [
@@ -419,7 +455,9 @@ def team_detail(db: Session, t: models.Team) -> dict:
         for d in (db.get(models.Document, did) for did in doc_ids)
         if d is not None
     ]
-    tu = scoring.team_understanding(db, t.id)
+    if idx is None:
+        idx = scoring.ScoreIndex(db, t.workspace_id)
+    tu = idx.group_understanding(member_ids, doc_ids or None)
     return {
         "id": t.id,
         "name": t.name,
@@ -436,11 +474,11 @@ def team_detail(db: Session, t: models.Team) -> dict:
     }
 
 
-def _teams(db: Session, ws_id: int) -> list[dict]:
+def _teams(db: Session, ws_id: int, idx: "scoring.ScoreIndex") -> list[dict]:
     rows = db.scalars(
         select(models.Team).where(models.Team.workspace_id == ws_id).order_by(models.Team.id)
     ).all()
-    return [team_detail(db, t) for t in rows]
+    return [team_detail(db, t, idx) for t in rows]
 
 
 # ---- learner-side ------------------------------------------------------------
@@ -467,19 +505,21 @@ def _section_count(db: Session, document_id: int) -> int:
     )
 
 
-def _learning_path(db: Session, user: models.User) -> list[dict]:
+def _learning_path(db: Session, user: models.User, idx: "scoring.ScoreIndex") -> list[dict]:
     out: list[dict] = []
-    for i in _path_items(db, user.id):
+    items = _path_items(db, user.id)
+    sections = _section_counts(db, [i.document_id for i in items])
+    for i in items:
         doc = db.get(models.Document, i.document_id)
         out.append(
             {
                 "docId": i.document_id,
                 "title": clean_name(doc.name) if doc else "",
-                "sections": _section_count(db, i.document_id),
+                "sections": sections.get(i.document_id, 0),
                 "status": i.status,
                 # % of the document taken to mastery, and how much is demonstrated.
-                "progress": scoring.document_completion(db, user.id, i.document_id),
-                "understanding": scoring.document_understanding(db, user.id, i.document_id),
+                "progress": idx.document_completion(user.id, i.document_id),
+                "understanding": idx.document_understanding(user.id, i.document_id),
             }
         )
     return out
@@ -487,7 +527,9 @@ def _learning_path(db: Session, user: models.User) -> list[dict]:
 
 def _my_documents(db: Session, user: models.User) -> list[dict]:
     out: list[dict] = []
-    for i in _path_items(db, user.id):
+    items = _path_items(db, user.id)
+    sections = _section_counts(db, [i.document_id for i in items])
+    for i in items:
         doc = db.get(models.Document, i.document_id)
         if doc is None:
             continue
@@ -496,7 +538,7 @@ def _my_documents(db: Session, user: models.User) -> list[dict]:
                 "docId": doc.id,
                 "name": clean_name(doc.name),
                 "pages": doc.chunk_count,
-                "sections": _section_count(db, doc.id),
+                "sections": sections.get(doc.id, 0),
                 "status": (
                     "Mastered"
                     if i.status == "mastered"
@@ -537,7 +579,7 @@ def _past_sessions(db: Session, user: models.User, limit: int = 10) -> list[dict
     return out
 
 
-def _continue_learning(db: Session, user: models.User) -> Optional[dict]:
+def _continue_learning(db: Session, user: models.User, idx: "scoring.ScoreIndex") -> Optional[dict]:
     item = db.scalar(
         select(models.LearningPathItem)
         .where(
@@ -553,13 +595,13 @@ def _continue_learning(db: Session, user: models.User) -> Optional[dict]:
         return None
     total = _section_count(db, doc.id)
     cur = scoring.next_section_idx(db, user.id, doc.id, total) + 1
-    completion = scoring.document_completion(db, user.id, doc.id)
+    completion = idx.document_completion(user.id, doc.id)
     return {
         "docId": doc.id,
         "doc": clean_name(doc.name),
         "position": f"Section {min(cur, total)} of {total}" if total else "Ready to start",
         "remaining": "Pick up where you left off." if completion else "Start your first section.",
-        "understanding": scoring.document_understanding(db, user.id, doc.id),
+        "understanding": idx.document_understanding(user.id, doc.id),
         "progress": completion,
     }
 
@@ -606,9 +648,9 @@ def _workspace_learners(db: Session, ws_id: int) -> list[models.User]:
     return list(db.scalars(select(models.User).where(models.User.workspace_id == ws_id)).all())
 
 
-def _kpis(db: Session, ws_id: int) -> list[dict]:
+def _kpis(db: Session, ws_id: int, idx: "scoring.ScoreIndex") -> list[dict]:
     users = _workspace_learners(db, ws_id)
-    measured = [v for v in (scoring.user_understanding(db, u.id) for u in users) if v is not None]
+    measured = [v for v in (idx.user_understanding(u.id) for u in users) if v is not None]
     avg = round(sum(measured) / len(measured)) if measured else 0
     at_risk = sum(1 for v in measured if v < settings.AT_RISK_THRESHOLD)
     items = (
@@ -631,9 +673,9 @@ def _kpis(db: Session, ws_id: int) -> list[dict]:
     ]
 
 
-def _understanding_kpis(db: Session, ws_id: int) -> list[dict]:
+def _understanding_kpis(db: Session, ws_id: int, idx: "scoring.ScoreIndex") -> list[dict]:
     users = _workspace_learners(db, ws_id)
-    measured = [v for v in (scoring.user_understanding(db, u.id) for u in users) if v is not None]
+    measured = [v for v in (idx.user_understanding(u.id) for u in users) if v is not None]
     avg = round(sum(measured) / len(measured)) if measured else 0
     docs = (
         db.scalar(
@@ -674,37 +716,45 @@ def _understanding_kpis(db: Session, ws_id: int) -> list[dict]:
     ]
 
 
-def _cohort_health(db: Session, ws_id: int) -> list[dict]:
+def _cohort_health(db: Session, ws_id: int, idx: "scoring.ScoreIndex") -> list[dict]:
     out: list[dict] = []
     for c in db.scalars(
         select(models.Cohort).where(models.Cohort.workspace_id == ws_id).order_by(models.Cohort.id)
     ).all():
-        cu = scoring.cohort_understanding(db, c.id)
+        members = scoring.cohort_member_ids(db, c.id)
+        docs = scoring.cohort_document_ids(db, c.id)
+        cu = idx.group_understanding(members, docs) if docs else None
         out.append(
             {
                 "name": c.name,
                 "value": cu or 0,
                 "band": scoring.band(cu),
-                "pct": scoring.cohort_completion(db, c.id),
+                "pct": idx.group_completion(members, docs),
             }
         )
     return out
 
 
-def _team_health(db: Session, ws_id: int) -> list[dict]:
+def _team_health(db: Session, ws_id: int, idx: "scoring.ScoreIndex") -> list[dict]:
     return [
-        {"name": t.name, "value": scoring.team_understanding(db, t.id) or 0}
+        {
+            "name": t.name,
+            "value": idx.group_understanding(
+                _team_member_ids(db, t.id), _team_doc_ids(db, t.id) or None
+            )
+            or 0,
+        }
         for t in db.scalars(
             select(models.Team).where(models.Team.workspace_id == ws_id).order_by(models.Team.id)
         ).all()
     ]
 
 
-def _falling_behind(db: Session, ws_id: int) -> list[dict]:
+def _falling_behind(db: Session, ws_id: int, idx: "scoring.ScoreIndex") -> list[dict]:
     cohort_of = _user_cohort_map(db, ws_id)
     out: list[dict] = []
     for u in _workspace_learners(db, ws_id):
-        score = scoring.user_understanding(db, u.id)
+        score = idx.user_understanding(u.id)
         if score is not None and score < settings.AT_RISK_THRESHOLD:
             out.append(
                 {
@@ -741,7 +791,12 @@ def build_bundle(db: Session, user: models.User, display_name: str) -> dict:
     ws = db.get(models.Workspace, user.workspace_id)
     needs_onboarding = (not ws.onboarded) and is_owner(db, user)
     stats = _learner_stats(db, user)
-    understanding = scoring.user_understanding(db, user.id)
+    # One batched read of every score input for this workspace, shared by every
+    # section below. They previously each recomputed the same figures — the
+    # People table, both KPI rows, the at-risk list and every cohort all asked
+    # for the same learner's understanding independently.
+    idx = scoring.ScoreIndex(db, user.workspace_id)
+    understanding = idx.user_understanding(user.id)
     return {
         "mode": "user",
         "needsOnboarding": needs_onboarding,
@@ -764,23 +819,23 @@ def build_bundle(db: Session, user: models.User, display_name: str) -> dict:
             "sessions": stats["sessions"],
             "streak": 0,
         },
-        "continueLearning": _continue_learning(db, user),
-        "learningPath": _learning_path(db, user),
+        "continueLearning": _continue_learning(db, user, idx),
+        "learningPath": _learning_path(db, user, idx),
         "pastSessions": _past_sessions(db, user),
         "myDocuments": _my_documents(db, user),
         "admin": {
-            "kpis": _kpis(db, user.workspace_id),
-            "understandingKpis": _understanding_kpis(db, user.workspace_id),
+            "kpis": _kpis(db, user.workspace_id, idx),
+            "understandingKpis": _understanding_kpis(db, user.workspace_id, idx),
             "understandingTrend": _understanding_trend(db, user.workspace_id),
             "understandingSeries": _understanding_series(db, user.workspace_id),
-            "cohortHealth": _cohort_health(db, user.workspace_id),
-            "teamHealth": _team_health(db, user.workspace_id),
-            "needsAttention": _falling_behind(db, user.workspace_id),
+            "cohortHealth": _cohort_health(db, user.workspace_id, idx),
+            "teamHealth": _team_health(db, user.workspace_id, idx),
+            "needsAttention": _falling_behind(db, user.workspace_id, idx),
             "recentActivity": [],
-            "cohorts": _cohorts(db, user.workspace_id),
-            "people": _people(db, user.workspace_id),
+            "cohorts": _cohorts(db, user.workspace_id, idx),
+            "people": _people(db, user.workspace_id, idx),
             "pendingInvites": _pending(db, user.workspace_id),
-            "teams": _teams(db, user.workspace_id),
+            "teams": _teams(db, user.workspace_id, idx),
             "documents": _documents(db, user.workspace_id),
         },
     }
