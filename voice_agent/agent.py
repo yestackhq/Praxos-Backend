@@ -115,6 +115,12 @@ class SessionContext:
         # up to `scored_upto`. The worker only grades what the browser did not,
         # so a section is never scored twice (and never billed twice).
         self.client_scored: bool = False
+        # Sections the learner advanced past whose grade the browser has NOT
+        # yet confirmed ({"module_idx", "turns"}). The browser's advance-time
+        # grade post is best-effort; twice now it silently failed and a real
+        # conversation vanished. The worker keeps the segment until a "scored"
+        # confirmation arrives, and grades whatever is still here at shutdown.
+        self.unconfirmed: list[dict] = []
 
     @property
     def valid(self) -> bool:
@@ -156,14 +162,12 @@ async def fetch_context(
             return None
 
 
-async def post_score(ctx: SessionContext, *, paused: bool) -> None:
-    """Grade whatever was said in the current section. The browser normally does
-    this; the worker is the safety net for a closed tab or a dropped network, so
-    a real conversation is never silently lost."""
-    turns = ctx.section_turns()
-    if ctx.posted or not turns:
+async def post_turns(
+    ctx: SessionContext, *, module_idx: int, turns: list[dict], paused: bool
+) -> None:
+    """Grade one section's turns via the agent-authenticated endpoint."""
+    if not turns:
         return
-    ctx.posted = True
     async with httpx.AsyncClient(timeout=60) as client:
         try:
             await client.post(
@@ -173,13 +177,36 @@ async def post_score(ctx: SessionContext, *, paused: bool) -> None:
                     "workspaceId": ctx.workspace_id,
                     "userId": ctx.user_id,
                     "documentId": ctx.document_id,
-                    "moduleIdx": ctx.module_idx,
+                    "moduleIdx": module_idx,
                     "transcript": turns,
                     "paused": paused,
                 },
             )
         except Exception as exc:
             logger.warning("agent score post failed: %s", exc)
+
+
+async def post_score(ctx: SessionContext, *, paused: bool) -> None:
+    """Grade whatever was said in the current section, plus any earlier section
+    whose browser-side grade was never confirmed. The browser normally grades;
+    the worker is the safety net for a closed tab, a dropped network — or a
+    grade request that silently died, so a real conversation is never lost."""
+    for seg in ctx.unconfirmed:
+        logger.warning(
+            "grading section %s from the safety net — the browser never confirmed it",
+            seg["module_idx"],
+        )
+        await post_turns(ctx, module_idx=seg["module_idx"], turns=seg["turns"], paused=False)
+    ctx.unconfirmed = []
+    # The current section: skipped when the browser said it is grading it
+    # itself (the "ending" message) — but the unconfirmed drain above runs
+    # regardless, because those segments are exactly the ones the browser
+    # failed to grade.
+    turns = ctx.section_turns()
+    if ctx.client_scored or ctx.posted or not turns:
+        return
+    ctx.posted = True
+    await post_turns(ctx, module_idx=ctx.module_idx, turns=turns, paused=paused)
 
 
 def _room_meta(room: rtc.Room, job_metadata: str = "") -> dict:
@@ -281,12 +308,12 @@ async def advance_section(
         except Exception as exc:
             logger.debug("interrupt before advance failed: %s", exc)
 
-        # 2. The browser grades the section being left (it holds the
-        #    learner's token, so that call is attributed to them as
-        #    verified). Record that so the worker's safety net does not
-        #    grade the same turns a second time.
-        sctx.client_scored = True
-
+        # 2. The browser grades the section being left (it holds the learner's
+        #    token, so that call is verified). But its post is not trusted until
+        #    a "scored" confirmation arrives — the leaving segment is captured
+        #    below into `unconfirmed`, and the safety net grades it at shutdown
+        #    if the confirmation never came. Trusting the browser at THIS point
+        #    is how two real conversations vanished when its post silently died.
         previous_idx = sctx.module_idx
         sctx.module_idx = target
         nxt = await (fetch or fetch_context)(sctx, advancing=True)
@@ -309,8 +336,13 @@ async def advance_section(
         # The section being left, captured BEFORE the boundary moves: handed to
         # the next section's instructions so cross-section carry-over does not
         # depend on the memory service having ingested a grade that is still
-        # being computed.
-        handoff = _handoff_block(sctx.section_turns())
+        # being computed — and kept in `unconfirmed` until the browser confirms
+        # its grade post actually succeeded.
+        leaving_turns = sctx.section_turns()
+        handoff = _handoff_block(leaving_turns)
+        if leaving_turns:
+            sctx.unconfirmed.append({"module_idx": previous_idx, "turns": leaving_turns})
+            del sctx.unconfirmed[:-4]  # bound the buffer; confirmations arrive in seconds
 
         sctx.module_idx = int(nxt.get("moduleIdx", target))
         sctx.is_last = bool(nxt.get("isLast", True))
@@ -338,13 +370,18 @@ async def advance_section(
         #    last thing there is the OLD section's "tap the button" closing
         #    line, and without this the model has opened the new section by
         #    repeating it.
+        #    tool_choice="none": the opener must be SPEECH. A model that spent
+        #    this reply on a silent mark_section_understood call left the
+        #    learner in a dead room saying "hello?" — a section cannot be
+        #    understood before it has been taught.
         session.generate_reply(
             instructions=(
                 "The learner just moved to the new section. In one sentence recap what "
                 "the previous section established, then teach this section's first key "
                 "point and ask one question. Do not say any section is finished and do "
                 "not mention any button."
-            )
+            ),
+            tool_choice="none",
         )
 
 
@@ -581,19 +618,21 @@ async def entrypoint(ctx: JobContext):
             # The browser is grading the final section itself and then leaving;
             # the shutdown safety net must not grade it again.
             sctx.client_scored = True
+        elif kind == "scored":
+            # The browser's advance-time grade post SUCCEEDED for this section —
+            # only now does the worker drop its copy of those turns.
+            confirmed = int(msg.get("moduleIdx", -1))
+            sctx.unconfirmed = [s for s in sctx.unconfirmed if s["module_idx"] != confirmed]
 
     @room.on("data_received")
     def _data(packet: rtc.DataPacket) -> None:
         asyncio.create_task(_on_data(packet))
 
     async def _flush(paused: bool = True) -> None:
-        """Grade the current section if — and only if — the browser did not.
-
-        Without this check the browser's score and the worker's safety net both
-        graded the same turns: two sittings recorded, and two billed model calls
-        for one conversation."""
-        if sctx.client_scored:
-            return
+        """Grade whatever the browser did not: every unconfirmed earlier
+        section, and the current one unless the browser claimed it ("ending").
+        The double-grading guard lives inside post_score, so an unconfirmed
+        segment is never skipped just because the final section was claimed."""
         await post_score(sctx, paused=paused)
 
     ctx.add_shutdown_callback(lambda: _flush(paused=True))

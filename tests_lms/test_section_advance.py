@@ -36,6 +36,7 @@ class FakeSession:
     def generate_reply(self, **kwargs):
         self.calls.append("generate_reply")
         self.reply_instructions = kwargs.get("instructions")
+        self.reply_kwargs = kwargs
 
 
 class FakeAgent:

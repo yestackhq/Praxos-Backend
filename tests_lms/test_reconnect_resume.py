@@ -156,3 +156,52 @@ def test_locate_ignores_an_old_pause(client, monkeypatch):
         assert resp["moduleIdx"] == 0
     finally:
         app.dependency_overrides.pop(optional_claims, None)
+
+
+def test_advance_keeps_the_leaving_turns_until_the_browser_confirms():
+    """The browser's advance-time grade post is best-effort; twice a silent
+    failure lost a whole section's conversation. The worker now keeps its copy
+    of the leaving segment until a "scored" confirmation arrives."""
+    ctx = _ctx(module_idx=0)
+    ctx.transcript = [
+        {"role": "tutor", "text": "What is the canvas?"},
+        {"role": "learner", "text": "A review sheet with the three lenses."},
+    ]
+    _, _, _, advance = _harness(ctx, _ok(1))
+    asyncio.run(advance(1))
+    assert len(ctx.unconfirmed) == 1
+    seg = ctx.unconfirmed[0]
+    assert seg["module_idx"] == 0
+    assert seg["turns"][-1]["text"] == "A review sheet with the three lenses."
+
+
+def test_safety_net_grades_unconfirmed_segments_even_when_the_end_was_claimed():
+    """"ending" means the browser grades the FINAL section itself. It must not
+    also bury an earlier section whose grade post never landed."""
+    from voice_agent import agent as agent_mod
+
+    ctx = _ctx(module_idx=1)
+    ctx.client_scored = True  # browser claimed the final section
+    ctx.unconfirmed = [{"module_idx": 0, "turns": [{"role": "learner", "text": "lens talk"}]}]
+    posted: list[tuple[int, bool]] = []
+
+    async def fake_post_turns(_ctx, *, module_idx, turns, paused):
+        posted.append((module_idx, paused))
+
+    orig = agent_mod.post_turns
+    agent_mod.post_turns = fake_post_turns
+    try:
+        asyncio.run(agent_mod.post_score(ctx, paused=True))
+    finally:
+        agent_mod.post_turns = orig
+    assert posted == [(0, False)], "the orphaned section is graded; the claimed final is not"
+    assert ctx.unconfirmed == []
+
+
+def test_section_opener_cannot_be_a_silent_tool_call():
+    """The first reply of a new section must be speech: a model that spent it on
+    a silent mark_section_understood left the learner in a dead room."""
+    ctx = _ctx(module_idx=0)
+    session, _, _, advance = _harness(ctx, _ok(1))
+    asyncio.run(advance(1))
+    assert session.reply_kwargs.get("tool_choice") == "none"
