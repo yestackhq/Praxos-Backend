@@ -19,7 +19,7 @@ import secrets
 from datetime import timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 from .. import ai, llm, memory, meldos, models, plan as plan_service, poke, scoring, tutor, voice
 from ..auth import active_membership, bearer_token
 from ..config import settings
-from ..db import get_db
+from ..db import SessionLocal, get_db
 
 logger = logging.getLogger("praxos.sessions")
 
@@ -50,6 +50,133 @@ class ScoreIn(BaseModel):
     transcript: list[Turn] = []
     moduleIdx: Optional[int] = None
     paused: bool = False  # learner paused mid-section (resume later) vs finished it
+    # Record the sitting immediately and grade in the background. Grading takes
+    # the assessor minutes on a long transcript; a resume decision made in that
+    # window sent the learner back into the section they had just finished.
+    # Used by the advance-time post, where nobody is waiting on the score.
+    deferred: bool = False
+
+
+def _record_sitting(
+    db: Session,
+    *,
+    user: models.User,
+    doc: models.Document,
+    module_idx: int,
+    transcript: list[dict],
+    paused: bool,
+    total_sections: int,
+) -> models.LearningSession:
+    """Persist participation NOW; the grade follows in the background.
+
+    A substantive sitting (the learner actually answered) counts as sitting the
+    section immediately, so resume and the path never depend on how long the
+    assessor takes. A tutor-only or filler sitting is recorded for audit but
+    does not move progress — the phantom-sitting rules are unchanged."""
+    row = models.LearningSession(
+        user_id=user.id,
+        document_id=doc.id,
+        module_idx=module_idx,
+        score=None,
+        covered=100,
+        summary="Grading in progress — the assessor is still reviewing this sitting.",
+        transcript=transcript,
+        learner_turns=sum(1 for t in transcript if t.get("role") == "learner"),
+        paused=paused,
+        ended_at=models.utcnow(),
+    )
+    db.add(row)
+    db.flush()
+    if ai.has_scoreable_answer(transcript):
+        prog = db.scalar(
+            select(models.SectionProgress).where(
+                models.SectionProgress.user_id == user.id,
+                models.SectionProgress.document_id == doc.id,
+                models.SectionProgress.module_idx == module_idx,
+            )
+        )
+        if prog is None:
+            prog = models.SectionProgress(
+                user_id=user.id, document_id=doc.id, module_idx=module_idx
+            )
+            db.add(prog)
+        prog.attempts = (prog.attempts or 0) + 1
+        prog.status = "paused" if paused else "in_progress"
+        prog.updated_at = models.utcnow()
+        scoring.refresh_path_item(
+            db, user_id=user.id, document_id=doc.id, total_sections=total_sections
+        )
+    return row
+
+
+def _finish_grading(session_id: int, user_id: int, document_id: int) -> None:
+    """Background: grade a recorded sitting and fold the score in. Attempts were
+    already counted at record time — this only fills score/summary and rolls the
+    best score into progress and the path."""
+    with SessionLocal() as db:
+        row = db.get(models.LearningSession, session_id)
+        user = db.get(models.User, user_id)
+        doc = db.get(models.Document, document_id)
+        if row is None or user is None or doc is None:
+            return
+        total = len(plan_service.get_modules(db, doc.id))
+        try:
+            result = _grade(
+                db,
+                user=user,
+                doc=doc,
+                module_idx=row.module_idx,
+                transcript=list(row.transcript or []),
+                end_user=llm.EndUser.claimed(user.name),
+            )
+        except meldos.MeldOSError as exc:
+            logger.warning(
+                "deferred grading failed (MeldOS %s); sitting %s stays unscored for regrade",
+                exc.status,
+                session_id,
+            )
+            return
+        if not result:
+            return
+        scoreable = bool(result.get("scoreable"))
+        row.score = result.get("score") if scoreable else None
+        try:
+            row.covered = max(0, min(100, int(result.get("covered"))))
+        except (TypeError, ValueError):
+            row.covered = 100
+        row.summary = str(result.get("summary", ""))[:2000]
+        row.topics = result.get("topics") or []
+        row.strengths = [str(s) for s in (result.get("strengths") or [])]
+        row.gaps = [str(g) for g in (result.get("gaps") or [])]
+        if row.score is not None:
+            prog = db.scalar(
+                select(models.SectionProgress).where(
+                    models.SectionProgress.user_id == user.id,
+                    models.SectionProgress.document_id == doc.id,
+                    models.SectionProgress.module_idx == row.module_idx,
+                )
+            )
+            if prog is not None:
+                prog.last_score = row.score
+                prog.best_score = (
+                    row.score if prog.best_score is None else max(prog.best_score, row.score)
+                )
+                if not row.paused and row.score >= settings.MASTERY_THRESHOLD:
+                    prog.status = "completed"
+                prog.updated_at = models.utcnow()
+        scoring.refresh_path_item(
+            db, user_id=user.id, document_id=doc.id, total_sections=total
+        )
+        db.commit()
+        memory.write_session(
+            workspace_id=user.workspace_id,
+            user_id=user.id,
+            document_id=doc.id,
+            session_id=row.id,
+            module_idx=row.module_idx,
+            transcript=list(row.transcript or []),
+            summary=str(result.get("summary") or "") or None,
+        )
 
 
 def _meldos_http_error(exc: meldos.MeldOSError) -> HTTPException:
@@ -294,6 +421,7 @@ def _grade(
 @router.post("/score")
 def score_session(
     body: ScoreIn,
+    background: BackgroundTasks,
     user: models.User = Depends(active_membership),
     token: Optional[str] = Depends(bearer_token),
     db: Session = Depends(get_db),
@@ -339,6 +467,43 @@ def score_session(
             "paused": body.paused,
         }
     module_idx = min(module_idx, max(0, total - 1))
+
+    if body.deferred and transcript:
+        # Advance-time post: nobody is looking at this response, but the resume
+        # point must be correct IMMEDIATELY — record participation now, grade in
+        # the background.
+        row = _record_sitting(
+            db,
+            user=user,
+            doc=doc,
+            module_idx=module_idx,
+            transcript=transcript,
+            paused=body.paused,
+            total_sections=total,
+        )
+        db.commit()
+        background.add_task(_finish_grading, row.id, user.id, doc.id)
+        doc_score = scoring.document_understanding(db, user.id, doc.id)
+        completion = scoring.document_completion(db, user.id, doc.id)
+        return {
+            "score": None,
+            "scoreable": False,
+            "graded": False,
+            "pending": True,
+            "summary": "Grading in progress.",
+            "topics": [],
+            "strengths": [],
+            "gaps": [],
+            "understanding": doc_score,
+            "band": scoring.band(doc_score),
+            "documentUnderstanding": doc_score,
+            "completion": completion,
+            "sectionBests": scoring.section_bests(db, user.id, doc.id),
+            "moduleIdx": module_idx,
+            "totalModules": total,
+            "courseComplete": completion >= 100,
+            "paused": body.paused,
+        }
 
     # The learner is signed in and this is their own request, so forward their
     # token for VERIFIED attribution. meldos.py refuses to attach it to anything
@@ -556,9 +721,15 @@ class AgentScoreIn(BaseModel):
 
 
 @router.post("/agent/score", dependencies=[Depends(_agent_auth)])
-def agent_score(body: AgentScoreIn, db: Session = Depends(get_db)) -> dict:
+def agent_score(
+    body: AgentScoreIn, background: BackgroundTasks, db: Session = Depends(get_db)
+) -> dict:
     """The worker posts the finished sitting here if the browser never did (tab
-    closed, network dropped) — so a real conversation is never lost unscored."""
+    closed, network dropped) — so a real conversation is never lost unscored.
+
+    Recorded immediately, graded in the background: the worker often posts from
+    its shutdown grace period (~10s), and a synchronous grading call held the
+    request open long enough for the process to be killed mid-flush."""
     user = db.get(models.User, body.userId)
     doc = db.get(models.Document, body.documentId)
     if user is None or doc is None or doc.workspace_id != user.workspace_id:
@@ -574,40 +745,15 @@ def agent_score(body: AgentScoreIn, db: Session = Depends(get_db)) -> dict:
         # sittings poisoned last-section scores.
         return {"recorded": False, "reason": "module index past the end of the plan"}
     idx = max(0, min(body.moduleIdx, max(0, len(modules) - 1)))
-    # The agent worker authenticates with a service secret and never holds the
-    # learner's token, so attribution here is CLAIMED, by name.
-    try:
-        result = _grade(
-            db,
-            user=user,
-            doc=doc,
-            module_idx=idx,
-            transcript=transcript,
-            end_user=llm.EndUser.claimed(user.name),
-        )
-    except meldos.MeldOSError as exc:
-        raise _meldos_http_error(exc) from None
-    if result is None:
-        return {"recorded": False, "reason": "no AI provider configured"}
-    row = scoring.apply_session(
+    row = _record_sitting(
         db,
         user=user,
-        document=doc,
+        doc=doc,
         module_idx=idx,
         transcript=transcript,
-        result=result,
         paused=body.paused,
         total_sections=len(modules),
     )
     db.commit()
-    db.refresh(row)
-    memory.write_session(
-        workspace_id=user.workspace_id,
-        user_id=user.id,
-        document_id=doc.id,
-        session_id=row.id,
-        module_idx=idx,
-        transcript=transcript,
-        summary=str(result.get("summary") or "") or None,
-    )
-    return {"recorded": True, "sessionId": row.id, "score": row.score}
+    background.add_task(_finish_grading, row.id, user.id, doc.id)
+    return {"recorded": True, "sessionId": row.id, "pending": True}

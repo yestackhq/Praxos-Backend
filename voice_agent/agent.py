@@ -374,15 +374,33 @@ async def advance_section(
         #    this reply on a silent mark_section_understood call left the
         #    learner in a dead room saying "hello?" — a section cannot be
         #    understood before it has been taught.
-        session.generate_reply(
-            instructions=(
-                "The learner just moved to the new section. In one sentence recap what "
-                "the previous section established, then teach this section's first key "
-                "point and ask one question. Do not say any section is finished and do "
-                "not mention any button."
-            ),
-            tool_choice="none",
+        opener_instructions = (
+            "The learner just moved to the new section. In one sentence recap what "
+            "the previous section established, then teach this section's first key "
+            "point and ask one question. Do not say any section is finished and do "
+            "not mention any button."
         )
+        swap_len = len(sctx.transcript)
+        session.generate_reply(instructions=opener_instructions, tool_choice="none")
+
+        # 4. If the opener never becomes audible — a playout glitch or a lost
+        #    model reply has left learners in a silent room more than once —
+        #    retry it once rather than sitting idle while they say "hello?".
+        async def _opener_watchdog() -> None:
+            await asyncio.sleep(10)
+            spoke = any(
+                t.get("role") == "tutor" for t in sctx.transcript[swap_len:]
+            ) or getattr(session, "current_speech", None) is not None
+            if not spoke:
+                logger.warning("section opener silent 10s after swap; retrying generate_reply")
+                try:
+                    session.generate_reply(
+                        instructions=opener_instructions, tool_choice="none"
+                    )
+                except Exception as exc:
+                    logger.warning("opener retry failed: %s", exc)
+
+        asyncio.create_task(_opener_watchdog())
 
 
 class TutorAgent(Agent):

@@ -205,3 +205,46 @@ def test_section_opener_cannot_be_a_silent_tool_call():
     session, _, _, advance = _harness(ctx, _ok(1))
     asyncio.run(advance(1))
     assert session.reply_kwargs.get("tool_choice") == "none"
+
+
+def test_recording_a_sitting_moves_the_resume_point_before_the_grade_lands(client, monkeypatch):
+    """Grading takes the assessor minutes; the resume point must not wait for
+    it. A substantive sitting counts as sat the moment it is recorded — a
+    filler sitting still does not (phantom-sitting rules unchanged)."""
+    from lms_app import models, scoring
+    from lms_app.auth import optional_claims
+    from lms_app.db import SessionLocal
+    from lms_app.main import app
+    from lms_app.routers.sessions import _record_sitting
+
+    did, uid, wsid = _seeded_doc(client, monkeypatch, "rc_defer")
+    try:
+        with SessionLocal() as db:
+            user = db.get(models.User, uid)
+            doc = db.get(models.Document, did)
+            row = _record_sitting(
+                db, user=user, doc=doc, module_idx=0,
+                transcript=[
+                    {"role": "tutor", "text": "What is alpha?"},
+                    {"role": "learner", "text": "Alpha is the first letter and it starts every sequence."},
+                ],
+                paused=False, total_sections=3,
+            )
+            db.commit()
+            assert row.score is None, "no grade yet — the assessor has not run"
+            assert scoring.next_section_idx(db, uid, did, 3) == 1, (
+                "the learner sat section 0; resume must move on immediately"
+            )
+
+            filler = _record_sitting(
+                db, user=user, doc=doc, module_idx=1,
+                transcript=[{"role": "tutor", "text": "Only the tutor spoke here."}],
+                paused=False, total_sections=3,
+            )
+            db.commit()
+            assert filler.score is None
+            assert scoring.next_section_idx(db, uid, did, 3) == 1, (
+                "a tutor-only sitting still does not count as sitting the section"
+            )
+    finally:
+        app.dependency_overrides.pop(optional_claims, None)
